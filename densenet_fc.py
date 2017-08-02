@@ -11,9 +11,11 @@ import warnings
 
 from keras.models import Model
 from keras.layers.core import Dropout, Activation, Reshape
-from keras.layers.convolutional import Convolution2D, Deconvolution2D, AtrousConvolution2D, UpSampling2D
+from keras.layers.noise import AlphaDropout
+from keras.layers.convolutional import Conv2D, Deconvolution2D, Conv2DTranspose , UpSampling2D
 from keras.layers.pooling import AveragePooling2D
-from keras.layers import Input, merge
+from keras.layers import Input
+from keras.layers.merge import Concatenate
 from keras.layers.normalization import BatchNormalization
 from keras.regularizers import l2
 from keras.engine.topology import get_source_inputs
@@ -170,7 +172,7 @@ def __conv_block(ip, nb_filter, bottleneck=False, dropout_rate=None, weight_deca
     concat_axis = 1 if K.image_dim_ordering() == "th" else -1
 
     if batch_norm:
-        x = BatchNormalization(mode=0, axis=concat_axis, gamma_regularizer=l2(weight_decay), beta_regularizer=l2(weight_decay))(ip)
+        x = BatchNormalization(axis=concat_axis, gamma_regularizer=l2(weight_decay), beta_regularizer=l2(weight_decay))(ip)
     else:
         x = ip
 
@@ -179,21 +181,21 @@ def __conv_block(ip, nb_filter, bottleneck=False, dropout_rate=None, weight_deca
     if bottleneck:
         inter_channel = nb_filter * 4  # Obtained from https://github.com/liuzhuang13/DenseNet/blob/master/densenet.lua
 
-        x = Convolution2D(inter_channel, 1, 1, init='he_uniform', border_mode='same', bias=False,
-                          W_regularizer=l2(weight_decay))(x)
+        x = Conv2D(inter_channel, (1, 1), kernel_initializer='he_uniform' if int_activation != 'selu' else 'lecun_normal', padding='same', use_bias=not batch_norm,
+                          kernel_regularizer=l2(weight_decay))(x)
 
         if dropout_rate:
-            x = Dropout(dropout_rate)(x)
+            x = Dropout(dropout_rate)(x) if int_activation != 'selu' else AlphaDropout(dropout_rate)(x)
 
         if batch_norm:
-            x = BatchNormalization(mode=0, axis=concat_axis, gamma_regularizer=l2(weight_decay), beta_regularizer=l2(weight_decay))(x)
+            x = BatchNormalization(axis=concat_axis, gamma_regularizer=l2(weight_decay), beta_regularizer=l2(weight_decay))(x)
 
         x = Activation(int_activation)(x)
 
-    x = Convolution2D(nb_filter, 3, 3, init="he_uniform", border_mode="same", bias=False,
-                      W_regularizer=l2(weight_decay))(x)
+    x = Conv2D(nb_filter, (3, 3), kernel_initializer='he_uniform' if int_activation != 'selu' else 'lecun_normal', padding="same", use_bias=not batch_norm,
+                      kernel_regularizer=l2(weight_decay))(x)
     if dropout_rate:
-        x = Dropout(dropout_rate)(x)
+        x = Dropout(dropout_rate)(x) if int_activation != 'selu' else AlphaDropout(dropout_rate)(x)
 
     return x
 
@@ -213,16 +215,16 @@ def __transition_block(ip, nb_filter, compression=1.0, dropout_rate=None, weight
     concat_axis = 1 if K.image_dim_ordering() == "th" else -1
 
     if batch_norm:
-        x = BatchNormalization(mode=0, axis=concat_axis, gamma_regularizer=l2(weight_decay),
+        x = BatchNormalization(axis=concat_axis, gamma_regularizer=l2(weight_decay),
             beta_regularizer=l2(weight_decay))(ip)
     else:
         x = ip
 
     x = Activation(int_activation)(x)
-    x = Convolution2D(int(nb_filter * compression), 1, 1, init="he_uniform", border_mode="same", bias=False,
-                      W_regularizer=l2(weight_decay))(x)
+    x = Conv2D(int(nb_filter * compression), (1, 1), kernel_initializer='he_uniform' if int_activation != 'selu' else 'lecun_normal', padding="same", use_bias=not batch_norm,
+                      kernel_regularizer=l2(weight_decay))(x)
     if dropout_rate:
-        x = Dropout(dropout_rate)(x)
+        x = Dropout(dropout_rate)(x) if int_activation != 'selu' else AlphaDropout(dropout_rate)(x)
 
     x = AveragePooling2D((2, 2), strides=(2, 2))(x)
 
@@ -253,7 +255,7 @@ def __dense_block(x, nb_layers, nb_filter, growth_rate, bottleneck=False, dropou
         x = __conv_block(x, growth_rate, bottleneck, dropout_rate, weight_decay, batch_norm, int_activation)
         x_list.append(x)
 
-        x = merge(x_list, mode='concat', concat_axis=concat_axis)
+        x = Concatenate(axis=concat_axis)(x_list)
 
         if grow_nb_filters:
             nb_filter += growth_rate
@@ -278,18 +280,18 @@ def __transition_up_block(ip, nb_filters, type='upsampling', output_shape=None, 
     if type == 'upsampling':
         x = UpSampling2D()(ip)
     elif type == 'subpixel':
-        x = Convolution2D(nb_filters, 3, 3, activation=int_activation, border_mode='same', W_regularizer=l2(weight_decay),
-                          bias=False, init='he_uniform')(ip)
+        x = Conv2D(nb_filters, (3, 3), activation=int_activation, padding='same', kernel_regularizer=l2(weight_decay),
+                          use_bias=False, kernel_initializer='he_uniform' if int_activation != 'selu' else 'lecun_normal')(ip)
         x = SubPixelUpscaling(scale_factor=2)(x)
-        x = Convolution2D(nb_filters, 3, 3, activation=int_activation, border_mode='same', W_regularizer=l2(weight_decay),
-                          bias=False, init='he_uniform')(x)
+        x = Conv2D(nb_filters, (3, 3), activation=int_activation, padding='same', kernel_regularizer=l2(weight_decay),
+                          use_bias=False, kernel_initializer='he_uniform' if int_activation != 'selu' else 'lecun_normal')(x)
     elif type == 'atrous':
         # waiting on https://github.com/fchollet/keras/issues/4018
-        x = AtrousConvolution2D(nb_filters, 3, 3, activation=int_activation, W_regularizer=l2(weight_decay),
-                                bias=False, atrous_rate=(2, 2), init='he_uniform')(ip)
+        x = Conv2DTranspose(nb_filters, (3, 3), activation=int_activation, kernel_regularizer=l2(weight_decay),
+                            use_bias=False, dilation_rate=(2, 2), kernel_initializer='he_uniform' if int_activation != 'selu' else 'lecun_normal')(ip)
     else:
-        x = Deconvolution2D(nb_filters, 3, 3, output_shape, activation=int_activation, border_mode='same',
-                            subsample=(2, 2), init='he_uniform')(ip)
+        x = Conv2DTranspose(nb_filters, (3, 3), activation=int_activation, padding='same',
+                            strides=(2, 2), kernel_initializer='he_uniform' if int_activation != 'selu' else 'lecun_normal')(ip)
 
     return x
 
@@ -361,8 +363,8 @@ def __create_fcn_dense_net(nb_classes, img_input, include_top, nb_dense_block=5,
     compression = 1.0 - reduction
 
     # Initial convolution
-    x = Convolution2D(init_conv_filters, 3, 3, init="he_uniform", border_mode="same", name="initial_conv2D", bias=False,
-                      W_regularizer=l2(weight_decay))(img_input)
+    x = Conv2D(init_conv_filters, (3, 3), kernel_initializer='he_uniform' if int_activation != 'selu' else 'lecun_normal', padding="same", name="initial_conv2D", use_bias=not batch_norm,
+                      kernel_regularizer=l2(weight_decay))(img_input)
 
     nb_filter = init_conv_filters
 
@@ -407,12 +409,12 @@ def __create_fcn_dense_net(nb_classes, img_input, include_top, nb_dense_block=5,
 
         # upsampling block must upsample only the feature maps (concat_list[1:]),
         # not the concatenation of the input with the feature maps (concat_list[0].
-        l = merge(concat_list[1:], mode='concat', concat_axis=concat_axis)
+        l = Concatenate(axis=concat_axis)(concat_list[1:])
 
         t = __transition_up_block(l, nb_filters=n_filters_keep, type=upsampling_type, output_shape=out_shape, int_activation=int_activation)
 
         # concatenate the skip connection with the transition block
-        x = merge([t, skip_list[block_idx]], mode='concat', concat_axis=concat_axis)
+        x = Concatenate(axis=concat_axis)([t, skip_list[block_idx]])
 
         if K.image_dim_ordering() == 'th':
             out_shape[2] *= 2
@@ -429,8 +431,8 @@ def __create_fcn_dense_net(nb_classes, img_input, include_top, nb_dense_block=5,
                                                   batch_norm=batch_norm, int_activation=int_activation)
 
     if include_top:
-        x = Convolution2D(nb_classes, 1, 1, activation='linear', border_mode='same', W_regularizer=l2(weight_decay),
-                          bias=False)(x)
+        x = Conv2D(nb_classes, (1, 1), activation='linear', padding='same', kernel_regularizer=l2(weight_decay),
+                          use_bias=not batch_norm)(x)
 
         if K.image_dim_ordering() == 'th':
             channel, row, col = input_shape

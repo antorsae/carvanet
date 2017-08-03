@@ -13,6 +13,8 @@ from keras import backend as K
 from keras.callbacks import ModelCheckpoint, ReduceLROnPlateau
 from keras.preprocessing.image import ImageDataGenerator
 from keras.models import load_model
+import itertools
+import re
 
 import densenet_fc as dc
 import unet
@@ -28,9 +30,13 @@ parser.add_argument('-yuv', '--yuv', action='store_true', help='Use native YUV w
 
 args = parser.parse_args()
 
-SX = 1920
-SY = 1280
-S  = args.scale
+
+SX   = 1920
+SY   = 1280
+S    = args.scale
+
+IMGS_IDX = range(1,17)
+IDXS     = len(IMGS_IDX)
 
 # From here: https://github.com/jocicmarko/ultrasound-nerve-segmentation/blob/master/train.py
 def dice_coef(y_true, y_pred):
@@ -80,71 +86,66 @@ def gen(items, batch_size, training=True):
     Xvar  = np.array([0.,0.,0.])
     Xmoments_printed = False
 
+    imgs_idx_to_flip = range(10,17)
+
     while True:
         if training:
             random.shuffle(items)
 
-        for item in items:
+        for _item in items:
 
-            imgs_idx   = [ 2, 16 ]#  list(range(1, 17))
+            item, idx = _item
 
-            if training:
-                random.shuffle(imgs_idx)
+            img = load_img(item, idx) / 255.
+            if idx in imgs_idx_to_flip:
+                img = np.flip(img, 1)
 
-            for idx in imgs_idx:
+            _img[:, :1918, :] = image_datagen.random_transform(img, seed=seed_idx) if training else img
+            _img[:, 1918:, :] = 0.
+            X[batch_idx] = rescale(_img, 1./S) if S != 1 else _img
 
-                img = load_img(item, idx) / 255.
-                if idx == 16:
-                    img = np.flip(img, 1)
+            mask = load_mask(item, idx)[...,:1] / 255.
+            if idx in imgs_idx_to_flip:
+                mask = np.flip(mask, 1)
 
-                _img[:, :1918, :] = image_datagen.random_transform(img, seed=seed_idx) if training else img
-                _img[:, 1918:, :] = 0.
-                X[batch_idx] = rescale(_img, 1./S) if S != 1 else _img
+            _mask[ :, :1918, :] = image_datagen.random_transform(mask, seed=seed_idx) if training else mask
+            _mask[ :, 1918:, :] = 0.
+            y[batch_idx] = rescale(_mask, 1./S) if S != 1 else _mask
 
-                mask = load_mask(item, idx)[...,:1] / 255.
-                if idx == 16:
-                    mask = np.flip(mask, 1)
+            seed_idx  += 1
+            batch_idx += 1
 
-                _mask[ :, :1918, :] = image_datagen.random_transform(mask, seed=seed_idx) if training else mask
-                _mask[ :, 1918:, :] = 0.
-                y[batch_idx] = rescale(_mask, 1./S) if S != 1 else _mask
+            if batch_idx == batch_size:
 
-                seed_idx += 1
-                batch_idx += 1
+                _X = X / np.array([ 0.2466268 ,  0.02347598,  0.02998368]) - np.array([  2.8039049 ,  21.16614256,  16.76252866])
 
-                if batch_idx == batch_size:
-                    
-                    X = X / np.array([ 0.23222641,  0.02161564,  0.02445954]) - np.array([  3.02408811,  22.88878766,  20.57160042])
+                #X = X / np.array([ 0.23165472,  0.23369996,  0.23183985]) - np.array([ 3.13899873,  3.12144822,  3.11967396])
 
-                    #X = X / np.array([ 0.23165472,  0.23369996,  0.23183985]) - np.array([ 3.13899873,  3.12144822,  3.11967396])
-                    #X /= 0.032
-                    #X -= 0.6#/0.032
+                y[ y >= 0.5] = 1.
+                y[ y <  0.5] = 0.
 
-                    y[ y >= 0.5] = 1.
-                    y[ y <  0.5] = 0.
+                if args.yuv:
+                    X_Y  = _X[...,:1]
+                    X_UV = downscale_local_mean(_X[...,1:3], (1,2,2,1))
+                    yield([X_Y,X_UV], y)
+                else:
+                    yield(_X, y)
+                batch_idx = 0
+                if (seed_idx % 10) == 0:
+                    for b in range(batch_size):
+                        imsave("_i"+str(b)+".jpg", X[b])
+                        imsave("_m"+str(b)+".jpg", y[b,...,0])
 
-                    if args.yuv:
-                        X_Y  = X[...,:1]
-                        X_UV = downscale_local_mean(X[...,1:3], (1,2,2,1))
-                        yield([X_Y,X_UV], y)
-                    else:
-                        yield(X, y)
-                    batch_idx = 0
-                    if (seed_idx % 10) == 0:
-                        for b in range(batch_size):
-                            imsave("_i"+str(b)+".jpg", X[b])
-                            imsave("_m"+str(b)+".jpg", y[b,...,0])
-
-                    Xsum += X.mean(axis=(0,1,2))
-                    if Xmean is not None:
-                        Xvar += ((X - Xmean) ** 2).mean(axis=(0,1,2))
+                Xsum += X.mean(axis=(0,1,2))
+                if Xmean is not None:
+                    Xvar += ((X - Xmean) ** 2).mean(axis=(0,1,2))
 
         if Xmoments_printed is False:
             if Xmean is None:
-                Xmean = Xsum / (len(items) * 2)
+                Xmean = Xsum / len(items)
                 print("Xmean: ", Xmean)
             else:
-                Xvar /= (len(items) * 2)
+                Xvar /= len(items) 
                 print("Xvar: ", Xvar)
                 print("Scale: 1./", np.sqrt(Xvar), "Offset: -", Xmean / np.sqrt(Xvar))
                 Xmoments_printed = True
@@ -154,7 +155,10 @@ def gen(items, batch_size, training=True):
 
 ids = list(set([(x.split('_')[0]).split('/')[1] for x in glob.glob('train/*_*.jpg')]))
 
-ids_train, ids_val = train_test_split(ids, test_size=0.2, random_state=42)
+ids_train, ids_val = train_test_split(ids, test_size=0.1)
+
+ids_train = list(itertools.product(ids_train, IMGS_IDX))
+ids_val   = list(itertools.product(ids_val,   IMGS_IDX))
 
 if args.model:
     print("Loading model " + args.model)
@@ -168,6 +172,8 @@ if args.model:
     keras.metrics.dice_coef = dice_coef
 
     model = load_model(args.model)
+    match = re.search(r'([a-z\-]+)-s\d.*\.hdf5', args.model)
+    model_name = match.group(1)
 
 else:
 
@@ -194,15 +200,15 @@ monitor = 'val_dice_coef'
 save_checkpoint = ModelCheckpoint(
         model_name+"-s"+str(S)+"-epoch{epoch:02d}"+metric+".hdf5",
         monitor=monitor,
-        verbose=0,  save_best_only=False, save_weights_only=False, mode='auto', period=1)
+        verbose=0,  save_best_only=True, save_weights_only=False, mode='max', period=1)
 
-reduce_lr = ReduceLROnPlateau(monitor=monitor, factor=0.5, patience=10, min_lr=1e-7, epsilon = 0.0001, verbose=1)
+reduce_lr = ReduceLROnPlateau(monitor=monitor, factor=0.5, patience=20, min_lr=1e-7, epsilon = 0.0001, verbose=1)
 
 model.fit_generator(
         generator        = gen(ids_train, args.batch_size),
-        steps_per_epoch  = len(ids_train) * 2  // args.batch_size,
+        steps_per_epoch  = len(ids_train)  // args.batch_size,
         validation_data  = gen(ids_val, args.batch_size, training = False),
-        validation_steps = len(ids_val) * 2 // args.batch_size,
+        validation_steps = len(ids_val) // args.batch_size,
         epochs = args.max_epoch,
         callbacks = [save_checkpoint, reduce_lr])
 

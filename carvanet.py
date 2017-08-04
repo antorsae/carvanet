@@ -15,6 +15,8 @@ from keras.preprocessing.image import ImageDataGenerator
 from keras.models import load_model
 import itertools
 import re
+import csv
+
 
 import densenet_fc as dc
 import unet
@@ -27,6 +29,7 @@ parser.add_argument('-m', '--model', help='load hdf5 model (and continue trainin
 parser.add_argument('-s', '--scale', type=int, default=1, help='downscale e.g. -s 2')
 parser.add_argument('-u', '--unet', action='store_true', help='use UNET')
 parser.add_argument('-yuv', '--yuv', action='store_true', help='Use native YUV with 4:2:2 downsampling')
+parser.add_argument('-t', '--test', action='store_true', help='Test model')
 
 args = parser.parse_args()
 
@@ -52,9 +55,11 @@ def bce_dice_loss(y_true, y_pred):
 def dice_coef_loss(y_true, y_pred):
     return 1. - dice_coef(y_true, y_pred)
 
-def gen(items, batch_size, training=True):
+def gen(items, batch_size, training=True, inference=False):
     X    = np.zeros((batch_size, SY//S, SX//S, 3), dtype=np.float32)
-    y    = np.zeros((batch_size, SY//S, SX//S, 1), dtype=np.float32)
+
+    if not inference:
+        y    = np.zeros((batch_size, SY//S, SX//S, 1), dtype=np.float32)
     
     X_Y  = np.zeros((batch_size, SY//S,     SX//S,     1), dtype=np.float32)
     X_UV = np.zeros((batch_size, SY//(S*2), SX//(S*2), 2), dtype=np.float32)
@@ -74,7 +79,7 @@ def gen(items, batch_size, training=True):
     assert batch_size <= 16
     input_folder = '.'
 
-    load_img   = lambda im, idx: imread(join(input_folder, 'train', '{}_{:02d}.jpg'.format(im, idx)), mode='YCbCr')
+    load_img   = lambda im, idx: imread(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx)), mode='YCbCr')
     load_mask  = lambda im, idx: imread(join(input_folder, 'train_masks', '{}_{:02d}_mask.gif'.format(im, idx)))
     mask_image = lambda im, mask: (im * np.expand_dims(mask, 2))
 
@@ -96,6 +101,19 @@ def gen(items, batch_size, training=True):
 
             item, idx = _item
 
+            if not inference:
+                mask = load_mask(item, idx)[...,:1] / 255.
+                if idx in imgs_idx_to_flip:
+                    mask = np.flip(mask, 1)
+
+                mask_in_borders = np.sum(mask[:,0]) + np.sum(mask[:,-1]) + np.sum(mask[0,:]) + np.sum(mask[-1,:])
+                if mask_in_borders:
+                    print(item)
+
+                _mask[ :, :1918, :] = image_datagen.random_transform(mask, seed=seed_idx) if training else mask
+                _mask[ :, 1918:, :] = 0.
+                y[batch_idx] = rescale(_mask, 1./S) if S != 1 else _mask
+
             img = load_img(item, idx) / 255.
             if idx in imgs_idx_to_flip:
                 img = np.flip(img, 1)
@@ -103,14 +121,6 @@ def gen(items, batch_size, training=True):
             _img[:, :1918, :] = image_datagen.random_transform(img, seed=seed_idx) if training else img
             _img[:, 1918:, :] = 0.
             X[batch_idx] = rescale(_img, 1./S) if S != 1 else _img
-
-            mask = load_mask(item, idx)[...,:1] / 255.
-            if idx in imgs_idx_to_flip:
-                mask = np.flip(mask, 1)
-
-            _mask[ :, :1918, :] = image_datagen.random_transform(mask, seed=seed_idx) if training else mask
-            _mask[ :, 1918:, :] = 0.
-            y[batch_idx] = rescale(_mask, 1./S) if S != 1 else _mask
 
             seed_idx  += 1
             batch_idx += 1
@@ -121,17 +131,23 @@ def gen(items, batch_size, training=True):
 
                 #X = X / np.array([ 0.23165472,  0.23369996,  0.23183985]) - np.array([ 3.13899873,  3.12144822,  3.11967396])
 
-                y[ y >= 0.5] = 1.
-                y[ y <  0.5] = 0.
+                if not inference:
+                    y[ y >= 0.5] = 1.
+                    y[ y <  0.5] = 0.
 
                 if args.yuv:
                     X_Y  = _X[...,:1]
                     X_UV = downscale_local_mean(_X[...,1:3], (1,2,2,1))
-                    yield([X_Y,X_UV], y)
-                else:
-                    yield(_X, y)
+
+                __X = [X_Y,X_UV] if args.yuv else _X
+
+                if not inference:
+                    yield(__X, y)
+                else:   
+                    yield(__X)
+
                 batch_idx = 0
-                if (seed_idx % 10) == 0:
+                if (seed_idx % 10) == 0 and not inference:
                     for b in range(batch_size):
                         imsave("_i"+str(b)+".jpg", X[b])
                         imsave("_m"+str(b)+".jpg", y[b,...,0])
@@ -151,7 +167,6 @@ def gen(items, batch_size, training=True):
                 Xmoments_printed = True
 
         Xsum = 0.
-
 
 ids = list(set([(x.split('_')[0]).split('/')[1] for x in glob.glob('train/*_*.jpg')]))
 
@@ -194,22 +209,77 @@ model.summary()
 
 model.compile(Adam(lr=args.learning_rate), loss='binary_crossentropy', metrics=['accuracy', dice_coef])
 
-metric  = "-val_dice_coef{val_dice_coef:.4f}"
-monitor = 'val_dice_coef'
+def rle_encode(pixels):
+    pixels = pixels.ravel()
+    np.rint(pixels, out=pixels)
+    
+    # We avoid issues with '1' at the start or end (at the corners of 
+    # the original image) by setting those pixels to '0' explicitly.
+    # We do not expect these to be non-zero for an accurate mask, 
+    # so this should not harm the score.
+    pixels[0] = 0
+    pixels[-1] = 0
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 2
+    runs[1::2] = runs[1::2] - runs[:-1:2]
+    runs[0::2] -= (runs[0::2]//1920) * 2
+    return runs
 
-save_checkpoint = ModelCheckpoint(
-        model_name+"-s"+str(S)+"-epoch{epoch:02d}"+metric+".hdf5",
-        monitor=monitor,
-        verbose=0,  save_best_only=True, save_weights_only=False, mode='max', period=1)
+def rle_to_string(runs):
+    return ' '.join(str(x) for x in runs)
 
-reduce_lr = ReduceLROnPlateau(monitor=monitor, factor=0.5, patience=20, min_lr=1e-7, epsilon = 0.0001, verbose=1)
+if args.test:
+    _ids_test = list(set([(x.split('_')[0]).split('/')[1] for x in glob.glob('test/*_*.jpg')]))
+    ids_test = list(itertools.product(_ids_test, IMGS_IDX))
 
-model.fit_generator(
-        generator        = gen(ids_train, args.batch_size),
-        steps_per_epoch  = len(ids_train)  // args.batch_size,
-        validation_data  = gen(ids_val, args.batch_size, training = False),
-        validation_steps = len(ids_val) // args.batch_size,
-        epochs = args.max_epoch,
-        callbacks = [save_checkpoint, reduce_lr])
+    generator = gen(ids_test, args.batch_size, training = False, inference = True)
+
+    with open('eggs.csv', 'wb') as csvfile:
+        writer = csv.writer(csvfile, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(['img', 'rle_mask'])
+        i = 0
+        for ids in itertools.izip(*[itertools.islice(ids_test, j, None, args.batch_size) for j in range(args.batch_size)]):
+            prediction_masks = model.predict_generator(generator, steps=1, verbose=0 )
+            print(ids, len(prediction_masks))
+            for idx,prediction_mask  in zip(ids, prediction_masks):
+                rle = rle_to_string(rle_encode(prediction_mask))
+                fname = '{}_{:02d}.jpg'.format(idx[0], idx[1])
+                writer.writerow([fname, rle])
+                print(str(i) + "/" + str(len(ids_test)))
+                i += 1
+
+
+else:
+    metric  = "-val_dice_coef{val_dice_coef:.4f}"
+    monitor = 'val_dice_coef'
+
+    save_checkpoint = ModelCheckpoint(
+            model_name+"-s"+str(S)+"-epoch{epoch:02d}"+metric+".hdf5",
+            monitor=monitor,
+            verbose=0,  save_best_only=True, save_weights_only=False, mode='max', period=1)
+
+    reduce_lr = ReduceLROnPlateau(monitor=monitor, factor=0.5, patience=20, min_lr=1e-7, epsilon = 0.0001, verbose=1)
+
+    # Function to display the target and prediciton
+    def testmodel(epoch, logs):
+        predx, predy = next(gen(ids_val, args.batch_size, training = False))
+        
+        predout = model.predict(
+            predx,
+            batch_size=args.batch_size
+        )
+        for b in args.batch_size:
+            imsave("GT_"+str(b)+".jpg", predy[b,...,0])
+            imsave("PR_"+str(b)+".jpg", predout[b,...,0])
+
+    # Callback to display the target and prediciton
+    testmodelcb = keras.callbacks.LambdaCallback(on_epoch_end=testmodel)
+
+    model.fit_generator(
+            generator        = gen(ids_train, args.batch_size),
+            steps_per_epoch  = len(ids_train)  // args.batch_size,
+            validation_data  = gen(ids_val, args.batch_size, training = False),
+            validation_steps = len(ids_val) // args.batch_size,
+            epochs = args.max_epoch,
+            callbacks = [save_checkpoint, reduce_lr, visualize_predictions, testmodelcb])
 
 

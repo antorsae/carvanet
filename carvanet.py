@@ -15,8 +15,9 @@ from keras.preprocessing.image import ImageDataGenerator
 from keras.models import load_model
 import itertools
 import re
+import sys
 import csv
-
+import jpeg4py as jpeg
 
 import densenet_fc as dc
 import unet
@@ -28,11 +29,13 @@ parser.add_argument('-l', '--learning_rate', type=float, default=1e-3, help='Ini
 parser.add_argument('-m', '--model', help='load hdf5 model (and continue training)')
 parser.add_argument('-s', '--scale', type=int, default=1, help='downscale e.g. -s 2')
 parser.add_argument('-u', '--unet', action='store_true', help='use UNET')
-parser.add_argument('-yuv', '--yuv', action='store_true', help='Use native YUV with 4:2:2 downsampling')
-parser.add_argument('-t', '--test', action='store_true', help='Test model')
+parser.add_argument('-yuv', '--yuv', action='store_true', help='Use native YUV (chroma not upsampled)')
+parser.add_argument('-t', '--test', action='store_true', help='Test model and generate CSV submission file')
+parser.add_argument('-v', '--validate', action='store_true', help='Validate CSV submission file')
+parser.add_argument('-f', '--filename', default='eggs.csv', help='CSV file for submission')
+parser.add_argument('-tf', '--test-files', nargs='*', help='List of test files')
 
 args = parser.parse_args()
-
 
 SX   = 1920
 SY   = 1280
@@ -41,6 +44,8 @@ S    = args.scale
 IMGS_IDX = range(1,17)
 IDXS     = len(IMGS_IDX)
 
+IMGS_IDX_TO_FLIP = range(10,17)
+
 # From here: https://github.com/jocicmarko/ultrasound-nerve-segmentation/blob/master/train.py
 def dice_coef(y_true, y_pred):
     smooth = 0.
@@ -48,6 +53,9 @@ def dice_coef(y_true, y_pred):
     y_pred_f = K.flatten(y_pred)
     intersection = K.sum(y_true_f * y_pred_f)
     return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
+
+def dice_mask(y_true, y_pred):
+    return dice_coef(y_true, K.round(y_pred))
 
 def bce_dice_loss(y_true, y_pred):
     return 0.5 * binary_crossentropy(y_true, y_pred) - dice_coef(y_true, y_pred)
@@ -79,8 +87,9 @@ def gen(items, batch_size, training=True, inference=False):
     assert batch_size <= 16
     input_folder = '.'
 
-    load_img   = lambda im, idx: imread(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx)), mode='YCbCr')
-    load_mask  = lambda im, idx: imread(join(input_folder, 'train_masks', '{}_{:02d}_mask.gif'.format(im, idx)))
+    load_img   = lambda im, idx: imread(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx)), mode='YCbCr') / 255.
+    load_yuv   = lambda im, idx: jpeg.JPEG(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx))).decodeYUV().astype(np.float32) / 255.
+    load_mask  = lambda im, idx: imread(join(input_folder, 'train_masks', '{}_{:02d}_mask.gif'.format(im, idx))) / 255.
     mask_image = lambda im, mask: (im * np.expand_dims(mask, 2))
 
     batch_idx = 0
@@ -91,8 +100,6 @@ def gen(items, batch_size, training=True, inference=False):
     Xvar  = np.array([0.,0.,0.])
     Xmoments_printed = False
 
-    imgs_idx_to_flip = range(10,17)
-
     while True:
         if training:
             random.shuffle(items)
@@ -102,44 +109,82 @@ def gen(items, batch_size, training=True, inference=False):
             item, idx = _item
 
             if not inference:
-                mask = load_mask(item, idx)[...,:1] / 255.
-                if idx in imgs_idx_to_flip:
-                    mask = np.flip(mask, 1)
+                mask = load_mask(item, idx)[...,:1]
+
 
                 mask_in_borders = np.sum(mask[:,0]) + np.sum(mask[:,-1]) + np.sum(mask[0,:]) + np.sum(mask[-1,:])
-                if mask_in_borders:
-                    print(item)
 
-                _mask[ :, :1918, :] = image_datagen.random_transform(mask, seed=seed_idx) if training else mask
+                _mask[ :, :1918, :] = image_datagen.random_transform(mask, seed=seed_idx) if training and (mask_in_borders == 0.) else mask
                 _mask[ :, 1918:, :] = 0.
+
+                if idx in IMGS_IDX_TO_FLIP:
+                    _mask = np.flip(_mask, 1)
+
                 y[batch_idx] = rescale(_mask, 1./S) if S != 1 else _mask
 
-            img = load_img(item, idx) / 255.
-            if idx in imgs_idx_to_flip:
-                img = np.flip(img, 1)
+            if args.yuv:
+                yuv  = load_yuv(item, idx)
+                _y   = yuv[:SX*SY].reshape((SY,SX,1))
+                if yuv.shape[0] == SX*SY + (2 * SX*SY//4):
+                    _u  = yuv[SX*SY            : SX*SY + SX*SY//4].reshape((SY//2, SX//2, 1))
+                    _v  = yuv[SX*SY + SX*SY//4 :                 ].reshape((SY//2, SX//2, 1))
+                    _uv = np.concatenate((_u,_v), axis=2)
+                elif yuv.shape[0] == SX*SY*3:
+                    _u  = yuv[SX*SY:SX*SY*2].reshape((SY, SX, 1))
+                    _v  = yuv[SX*SY*2:     ].reshape((SY, SX, 1))
+                    _u  = downscale_local_mean(_u, (2,2,1))
+                    _v  = downscale_local_mean(_v, (2,2,1))
+                    _uv = np.concatenate((_u,_v), axis=2)
 
-            _img[:, :1918, :] = image_datagen.random_transform(img, seed=seed_idx) if training else img
-            _img[:, 1918:, :] = 0.
-            X[batch_idx] = rescale(_img, 1./S) if S != 1 else _img
+                else:
+                    assert False
+
+                if idx in IMGS_IDX_TO_FLIP:
+                    _y  = np.flip(_y,  1)
+                    _uv = np.flip(_uv, 1)
+
+                _y   = image_datagen.random_transform(_y,  seed=seed_idx) if training and (mask_in_borders == 0.) else _y
+                _uv  = image_datagen.random_transform(_uv, seed=seed_idx) if training and (mask_in_borders == 0.) else _uv
+
+                X_Y[batch_idx]  = rescale(_y,  1./S) if S != 1 else _y
+                X_UV[batch_idx] = rescale(_uv, 1./S) if S != 1 else _uv
+
+                del _y
+                del _uv
+                del yuv
+
+            else:
+                img = load_img(item, idx)
+
+                _img[:, :1918, :] = image_datagen.random_transform(img, seed=seed_idx) if training and (mask_in_borders == 0.) else img
+                _img[:, 1918:, :] = 0.
+
+                if idx in IMGS_IDX_TO_FLIP:
+                    _img = np.flip(_img, 1)
+
+                X[batch_idx] = rescale(_img, 1./S) if S != 1 else _img
 
             seed_idx  += 1
             batch_idx += 1
 
             if batch_idx == batch_size:
 
-                _X = X / np.array([ 0.2466268 ,  0.02347598,  0.02998368]) - np.array([  2.8039049 ,  21.16614256,  16.76252866])
+                if args.yuv:
+                # X = X / np.array([ 0.2466268 ,  0.02347598,  0.02998368]) - np.array([  2.8039049 ,  21.16614256,  16.76252866])
+                    X_Y  /= 0.2466268
+                    X_Y  -= 2.8039049
 
-                #X = X / np.array([ 0.23165472,  0.23369996,  0.23183985]) - np.array([ 3.13899873,  3.12144822,  3.11967396])
+                    X_UV /= np.float32([  0.02347598,  0.02998368 ]) 
+                    X_UV -= np.float32([ 21.16614256, 16.76252866 ])
+
+                else:
+                    X = X / np.float32([ 0.23165472,  0.23369996,  0.23183985]) - np.float32([ 3.13899873,  3.12144822,  3.11967396])
 
                 if not inference:
                     y[ y >= 0.5] = 1.
                     y[ y <  0.5] = 0.
 
-                if args.yuv:
-                    X_Y  = _X[...,:1]
-                    X_UV = downscale_local_mean(_X[...,1:3], (1,2,2,1))
-
-                __X = [X_Y,X_UV] if args.yuv else _X
+                __X = [X_Y,X_UV] if args.yuv else X
 
                 if not inference:
                     yield(__X, y)
@@ -147,16 +192,23 @@ def gen(items, batch_size, training=True, inference=False):
                     yield(__X)
 
                 batch_idx = 0
-                if (seed_idx % 10) == 0 and not inference:
+                if (seed_idx % 10) == 0 :
                     for b in range(batch_size):
-                        imsave("_i"+str(b)+".jpg", X[b])
-                        imsave("_m"+str(b)+".jpg", y[b,...,0])
+                        if args.yuv:
+                            imsave("_i_Y"+str(b)+".jpg",  X_Y[b,...,0])
+                            imsave("_i_U"+str(b)+".jpg", X_UV[b,...,0])
+                            imsave("_i_V"+str(b)+".jpg", X_UV[b,...,1])
+                        else:
+                            imsave("_i"+str(b)+".jpg", X[b])
+                        if not inference:
+                            imsave("_m"+str(b)+".jpg", y[b,...,0])
 
-                Xsum += X.mean(axis=(0,1,2))
-                if Xmean is not None:
-                    Xvar += ((X - Xmean) ** 2).mean(axis=(0,1,2))
+                if not args.yuv:
+                    Xsum += X.mean(axis=(0,1,2))
+                    if Xmean is not None:
+                        Xvar += ((X - Xmean) ** 2).mean(axis=(0,1,2))
 
-        if Xmoments_printed is False:
+        if Xmoments_printed is False and not args.yuv:
             if Xmean is None:
                 Xmean = Xsum / len(items)
                 print("Xmean: ", Xmean)
@@ -185,6 +237,8 @@ if args.model:
     keras.losses.bce_dice_loss = bce_dice_loss
     keras.losses.dice_coef_loss = dice_coef_loss
     keras.metrics.dice_coef = dice_coef
+    keras.metrics.dice_mask = dice_mask
+
 
     model = load_model(args.model)
     match = re.search(r'([a-z\-]+)-s\d.*\.hdf5', args.model)
@@ -207,7 +261,7 @@ else:
 
 model.summary()
 
-model.compile(Adam(lr=args.learning_rate), loss='binary_crossentropy', metrics=['accuracy', dice_coef])
+model.compile(Adam(lr=args.learning_rate), loss=bce_dice_loss, metrics=['accuracy', dice_coef, dice_mask])
 
 def rle_encode(pixels):
     pixels = pixels.ravel()
@@ -217,7 +271,7 @@ def rle_encode(pixels):
     # the original image) by setting those pixels to '0' explicitly.
     # We do not expect these to be non-zero for an accurate mask, 
     # so this should not harm the score.
-    pixels[0] = 0
+    pixels[0]  = 0
     pixels[-1] = 0
     runs = np.where(pixels[1:] != pixels[:-1])[0] + 2
     runs[1::2] = runs[1::2] - runs[:-1:2]
@@ -228,25 +282,54 @@ def rle_to_string(runs):
     return ' '.join(str(x) for x in runs)
 
 if args.test:
-    _ids_test = list(set([(x.split('_')[0]).split('/')[1] for x in glob.glob('test/*_*.jpg')]))
-    ids_test = list(itertools.product(_ids_test, IMGS_IDX))
+    if args.test_files:
+        ids_test = [[x.split('_')[0], int(x.split('_')[1])] for x in args.test_files]
+        print(ids_test)
+    else:
+        _ids_test = list(set([(x.split('_')[0]).split('/')[1] for x in glob.glob('test/*_*.jpg')]))
+        ids_test = list(itertools.product(_ids_test, IMGS_IDX))
 
     generator = gen(ids_test, args.batch_size, training = False, inference = True)
 
-    with open('eggs.csv', 'wb') as csvfile:
+    with open(args.filename, 'wb') as csvfile:
         writer = csv.writer(csvfile, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
         writer.writerow(['img', 'rle_mask'])
         i = 0
         for ids in itertools.izip(*[itertools.islice(ids_test, j, None, args.batch_size) for j in range(args.batch_size)]):
-            prediction_masks = model.predict_generator(generator, steps=1, verbose=0 )
+            prediction_masks = model.predict_on_batch(next(generator))
             print(ids, len(prediction_masks))
             for idx,prediction_mask  in zip(ids, prediction_masks):
-                rle = rle_to_string(rle_encode(prediction_mask))
                 fname = '{}_{:02d}.jpg'.format(idx[0], idx[1])
+                if idx[1] in IMGS_IDX_TO_FLIP:
+                    prediction_mask = np.flip(prediction_mask, 1)
+                if args.test_files:
+                    imsave('pred_'+fname, prediction_mask[...,0])
+                rle = rle_to_string(rle_encode(prediction_mask))
                 writer.writerow([fname, rle])
                 print(str(i) + "/" + str(len(ids_test)))
                 i += 1
 
+elif args.validate:
+    csv.field_size_limit(sys.maxsize)
+    with open(args.filename, 'rb') as csvfile:
+
+        reader = csv.reader(csvfile, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+        assert next(reader) == ['img', 'rle_mask']
+        for f in reader:
+            assert len(f) == 2
+            file = f[0]
+            mask = map(int, f[1].split(' '))
+            bad_file = False
+            for m in itertools.izip(*[itertools.islice(mask, j, None, 2) for j in range(2)]):
+                y = m[0] // 1918
+                x = m[0]  % 1918
+                r = m[1]
+                assert y < SY
+                if x + r > 1918:
+                    if not bad_file:
+                        print(file, x, y, r, m)
+                    bad_file = True
+                    #assert False
 
 else:
     metric  = "-val_dice_coef{val_dice_coef:.4f}"
@@ -267,7 +350,7 @@ else:
             predx,
             batch_size=args.batch_size
         )
-        for b in args.batch_size:
+        for b in range(args.batch_size):
             imsave("GT_"+str(b)+".jpg", predy[b,...,0])
             imsave("PR_"+str(b)+".jpg", predout[b,...,0])
 
@@ -280,6 +363,6 @@ else:
             validation_data  = gen(ids_val, args.batch_size, training = False),
             validation_steps = len(ids_val) // args.batch_size,
             epochs = args.max_epoch,
-            callbacks = [save_checkpoint, reduce_lr, visualize_predictions, testmodelcb])
+            callbacks = [save_checkpoint, reduce_lr, testmodelcb])
 
 

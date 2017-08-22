@@ -2,6 +2,7 @@ from keras.models import Model
 from keras.layers import Input, concatenate, Conv2D, MaxPooling2D, Conv2DTranspose, Add, Dropout, BatchNormalization, Activation
 from keras_contrib.initializers import ConvolutionAware
 from keras_contrib.layers.normalization import InstanceNormalization
+from pooling import MaxPoolingWithArgmax2D, MaxUnpooling2D
 
 def UNet(input_shape, nb_dense_block=5, growth_rate=16, nb_layers_per_block=4,
                 reduction=0.0, dropout_rate=0.0, weight_decay=1E-4, init_conv_filters=48,
@@ -122,21 +123,26 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
         features = []
         for i, (channel, dilation) in enumerate(zip(channels, dilations)):
             if i != len(channels) - 1:
-                ff = f
+                ff  = f
+                res = f
             else:
                 ff = list(features)
                 ff.append(f)
                 ff = concatenate(ff, axis=3)
+                res = None
             if (i == len(channels) - 1) and batch_norm:
                 f = Conv2D(channel, kernel, use_bias=False, padding='same', kernel_initializer='he_uniform', dilation_rate= dilation)(ff)
                 f = InstanceNormalization(axis=3)(f)
                 f = Activation(int_activation)(f)
             else:
                 f = Conv2D(channel, kernel, activation = int_activation, padding='same', kernel_initializer='he_uniform', dilation_rate= dilation)(ff)
+            if res is not None and (f.shape[-1] == res.shape[-1]):
+                f = Add()([f, res])
             features.append(f)
 
         if downsample:
             return (f, MaxPooling2D(pool_size=(2, 2))(f))
+#            return (f, MaxPoolingWithArgmax2D(pool_size=(2, 2))(f))
         else:
             return f
 
@@ -144,30 +150,36 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
         features = []
         if not dilations:
             dilations = [1] * len(channels)
-        u = concatenate([Conv2DTranspose(channels[0], (2, 2), strides=(2, 2), use_bias=False, padding='same')(c), s], axis=3)
+        u = concatenate([Conv2DTranspose(channels[0], (2, 2), strides=(2, 2), use_bias=False, padding='same')(f), s], axis=3)
+        #u = concatenate([Conv2DTranspose(channels[0], (2, 2), strides=(1, 1), use_bias=False, padding='same')(MaxUnpooling2D(f)), s], axis=3)
         for i, (channel, dilation) in enumerate(zip(channels, dilations)):
             if i != len(channels) - 1:
-                ff = u
+                ff  = u
+                res = u
             else:
                 ff = list(features)
                 ff.append(u)
                 ff = concatenate(ff, axis=3)
+                res = None
             if (i == len(channels) - 1) and batch_norm:
                 u = Conv2D(channel, kernel, use_bias=False, padding='same', kernel_initializer='he_uniform', dilation_rate=dilation)(ff)
                 u = InstanceNormalization(axis=3)(u)
                 u = Activation(int_activation)(u)
             else:
                 u = Conv2D(channel, kernel, activation=int_activation, padding='same', kernel_initializer='he_uniform', dilation_rate= dilation)(ff)
+            if res is not None and (u.shape[-1] == res.shape[-1]):
+                u = Add()([u, res])
             features.append(u)
         return u, features
 
     skip = []
     K = 3
+    J = 3
 
-    cY,c  = downblock(Y, channels = [8] * 8, kernel = K)
+    cY,c  = downblock(Y, channels = [12] * 8, kernel = J)
     skip.append(cY)
 
-    cUV = downblock(UV, channels = [2] * 4, kernel = K, downsample=False)
+    cUV = downblock(UV, channels = [4] * 4, kernel = K, downsample=False)
 
     c = concatenate([c, cUV], axis=3)
 
@@ -181,7 +193,7 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
     c = downblock(c, channels = downblocks[-1], kernel = K, downsample=False)
 
     upblocks = list(downblocks[::-1])
-    upblocks.append([8] * 8)
+    upblocks.append([12] * 8)
 
     dilations = dilations[::-1]
     dilations.append([1] * 8)
@@ -189,7 +201,7 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
     print(upblocks)
 
     for l, (ub, ui) in enumerate(zip(upblocks, dilations)):
-        c, cc = upblock(c, skip[-l-1], channels = ub , kernel = K, dilations = ui)
+        c, cc = upblock(c, skip[-l-1], channels = ub , kernel = K if l != (len(upblocks)-1) else J, dilations = ui)
 
     c = Conv2D(1, (1, 1), activation=activation)(concatenate(cc, axis=3))
 

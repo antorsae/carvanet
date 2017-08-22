@@ -413,9 +413,10 @@ elif args.validate:
 else:
     metric  = "-val_dice_coef{val_dice_coef:.4f}"
     monitor = 'val_dice_coef'
+    idx = "" if IMGS_IDX == range(1,17) else "_" + "_".join(map(str,IMGS_IDX))
 
     save_checkpoint = ModelCheckpoint(
-            model_name+"-s"+str(S)+"-epoch{epoch:02d}"+metric+".hdf5",
+            model_name+idx+"-s"+str(S)+"-epoch{epoch:02d}"+metric+".hdf5",
             monitor=monitor,
             verbose=0,  save_best_only=True, save_weights_only=False, mode='max', period=1)
 

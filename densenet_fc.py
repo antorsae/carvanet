@@ -11,7 +11,7 @@ import warnings
 
 from keras.models import Model
 from keras.layers.core import Dropout, Activation, Reshape
-from keras.layers.noise import AlphaDropout
+#from keras.layers.noise import AlphaDropout
 from keras.layers.convolutional import Conv2D, Deconvolution2D, Conv2DTranspose , UpSampling2D
 from keras.layers.pooling import AveragePooling2D
 from keras.layers import Input
@@ -25,7 +25,7 @@ import keras.backend as K
 from layers import SubPixelUpscaling
 
 
-def DenseNetFCN(input_shape, nb_dense_block=5, growth_rate=16, nb_layers_per_block=4,
+def DenseNetFCN(input_shape, yuv=False, nb_dense_block=5, growth_rate=16, nb_layers_per_block=4,
                 reduction=0.0, dropout_rate=0.0, weight_decay=1E-4, init_conv_filters=48,
                 include_top=True, weights=None, input_tensor=None, classes=1, activation='softmax',
                 upsampling_conv=128, upsampling_type='upsampling', batchsize=None, batch_norm=True, int_activation='relu'):
@@ -132,19 +132,20 @@ def DenseNetFCN(input_shape, nb_dense_block=5, growth_rate=16, nb_layers_per_blo
         else:
             input_shape = (None, None, classes)
 
+    if yuv:
+        input_y_shape  = (input_shape[0],   input_shape[1],   1)
+        input_uv_shape = (input_shape[0]//2,input_shape[1]//2,2)
+
     if input_tensor is None:
-        img_input = Input(shape=input_shape)
+        if yuv:
+            img_input = [Input(shape=input_y_shape), Input(shape=input_uv_shape)]
+        else:
+            img_input = Input(shape=input_shape)
     else:
         if not K.is_keras_tensor(input_tensor):
             img_input = Input(tensor=input_tensor, shape=input_shape)
-        else:
+        else :
             img_input = input_tensor
-
-    x = __create_fcn_dense_net(classes, img_input, include_top, nb_dense_block,
-                               growth_rate, reduction, dropout_rate, weight_decay,
-                               nb_layers_per_block, upsampling_conv, upsampling_type,
-                               batchsize, init_conv_filters, input_shape, activation, 
-                               batch_norm, int_activation)
 
     # Ensure that the model takes into account
     # any potential predecessors of `input_tensor`.
@@ -152,6 +153,14 @@ def DenseNetFCN(input_shape, nb_dense_block=5, growth_rate=16, nb_layers_per_blo
         inputs = get_source_inputs(input_tensor)
     else:
         inputs = img_input
+
+    x = __create_fcn_dense_net(classes, img_input, yuv, include_top, nb_dense_block,
+                               growth_rate, reduction, dropout_rate, weight_decay,
+                               nb_layers_per_block, upsampling_conv, upsampling_type,
+                               batchsize, init_conv_filters, input_shape, activation, 
+                               batch_norm, int_activation)
+
+
     # Create model.
     model = Model(inputs, x, name='fcn-densenet')
 
@@ -296,7 +305,7 @@ def __transition_up_block(ip, nb_filters, type='upsampling', output_shape=None, 
     return x
 
 
-def __create_fcn_dense_net(nb_classes, img_input, include_top, nb_dense_block=5, growth_rate=12,
+def __create_fcn_dense_net(nb_classes, img_inputs, yuv, include_top, nb_dense_block=5, growth_rate=12,
                            reduction=0.0, dropout_rate=None, weight_decay=1E-4,
                            nb_layers_per_block=4, nb_upsampling_conv=128, upsampling_type='upsampling',
                            batchsize=None, init_conv_filters=48, input_shape=None, activation='softmax', 
@@ -362,9 +371,11 @@ def __create_fcn_dense_net(nb_classes, img_input, include_top, nb_dense_block=5,
     # compute compression factor
     compression = 1.0 - reduction
 
+    img_input = img_inputs[0] if yuv else img_inputs
+    
     # Initial convolution
-    x = Conv2D(init_conv_filters, (3, 3), kernel_initializer='he_uniform' if int_activation != 'selu' else 'lecun_normal', padding="same", name="initial_conv2D", use_bias=not batch_norm,
-                      kernel_regularizer=l2(weight_decay))(img_input)
+    x = Conv2D(init_conv_filters, (3, 3), kernel_initializer='he_uniform' if int_activation != 'selu' else 'lecun_normal', 
+        padding="same", name="initial_conv2D", use_bias=not batch_norm, kernel_regularizer=l2(weight_decay))(img_input)
 
     nb_filter = init_conv_filters
 
@@ -372,6 +383,12 @@ def __create_fcn_dense_net(nb_classes, img_input, include_top, nb_dense_block=5,
 
     # Add dense blocks and transition down block
     for block_idx in range(nb_dense_block):
+
+        if yuv and block_idx == 1:
+            xx = Conv2D(init_conv_filters, (3, 3), kernel_initializer='he_uniform' if int_activation != 'selu' else 'lecun_normal', 
+                padding="same", name="initial_conv2D_uv", use_bias=not batch_norm, kernel_regularizer=l2(weight_decay))(img_inputs[1])
+            x = Concatenate(axis=concat_axis)([x, xx])
+
         x, nb_filter = __dense_block(x, nb_layers[block_idx], nb_filter, growth_rate,
                                      dropout_rate=dropout_rate, weight_decay=weight_decay, 
                                      batch_norm=batch_norm, int_activation=int_activation)
@@ -431,9 +448,10 @@ def __create_fcn_dense_net(nb_classes, img_input, include_top, nb_dense_block=5,
                                                   batch_norm=batch_norm, int_activation=int_activation)
 
     if include_top:
-        x = Conv2D(nb_classes, (1, 1), activation='linear', padding='same', kernel_regularizer=l2(weight_decay),
+        x = Conv2D(nb_classes, (1, 1), activation=activation, padding='same', kernel_regularizer=l2(weight_decay),
                           use_bias=not batch_norm)(x)
 
+        '''
         if K.image_dim_ordering() == 'th':
             channel, row, col = input_shape
         else:
@@ -442,7 +460,7 @@ def __create_fcn_dense_net(nb_classes, img_input, include_top, nb_dense_block=5,
         x = Reshape((row * col, nb_classes))(x)
         x = Activation(activation)(x)
         x = Reshape((row, col, nb_classes))(x)
-
+'''
     return x
 
 if __name__ == '__main__':

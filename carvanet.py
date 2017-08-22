@@ -7,21 +7,26 @@ from scipy.misc import imread, imsave
 from os.path import join
 from sklearn.model_selection import train_test_split
 from skimage.transform import rescale, downscale_local_mean
-from keras.optimizers import Adam, Adadelta
+from keras.optimizers import Adam, Adadelta, SGD
 from keras.losses import binary_crossentropy
 from keras import backend as K
 from keras.callbacks import ModelCheckpoint, ReduceLROnPlateau, LambdaCallback
 from keras.preprocessing.image import ImageDataGenerator
-from keras.models import load_model
+from keras.models import load_model, Model
+from keras.layers import concatenate, Lambda
 import itertools
 import re
+import os
 import sys
 import csv
 from tqdm import tqdm
 import jpeg4py as jpeg
+#from crfrnn_layer import CrfRnnLayer as CRF
+from keras_contrib.layers import CRF
 
 import densenet_fc as dc
 import unet
+from nadamaccum import * 
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--max-epoch', type=int, default=200, help='Epoch to run')
@@ -30,22 +35,34 @@ parser.add_argument('-l', '--learning_rate', type=float, default=1e-3, help='Ini
 parser.add_argument('-m', '--model', help='load hdf5 model (and continue training)')
 parser.add_argument('-s', '--scale', type=int, default=1, help='downscale e.g. -s 2')
 parser.add_argument('-u', '--unet', action='store_true', help='use UNET')
+parser.add_argument('-r', '--resnet', action='store_true', help='use residual dilated nets')
 parser.add_argument('-yuv', '--yuv', action='store_true', help='Use native YUV (chroma not upsampled)')
 parser.add_argument('-t', '--test', action='store_true', help='Test model and generate CSV submission file')
 parser.add_argument('-v', '--validate', action='store_true', help='Validate CSV submission file')
 parser.add_argument('-f', '--filename', default='eggs.csv', help='CSV file for submission')
 parser.add_argument('-tf', '--test-files', nargs='*', help='List of test files')
+parser.add_argument('-crf', '--crf', action='store_true', help='Add CRF layer')
+parser.add_argument('-c', '--cpu', action='store_true', help='force CPU usage')
+parser.add_argument('-i', '--idx', type=int, nargs='+', help='Indexes to use, e.g. -i 2 16')
 
 args = parser.parse_args()
+
+if args.cpu:
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 SX   = 1920
 SY   = 1280
 S    = args.scale
 
-IMGS_IDX = range(1,17)
+if args.idx:
+    IMGS_IDX = args.idx
+else:
+    IMGS_IDX = range(1,17)
+
 IDXS     = len(IMGS_IDX)
 
-IMGS_IDX_TO_FLIP = []#range(10,17)
+IMGS_IDX_TO_FLIP = range(10,17)
 
 # From here: https://github.com/jocicmarko/ultrasound-nerve-segmentation/blob/master/train.py
 def dice_coef(y_true, y_pred):
@@ -55,6 +72,20 @@ def dice_coef(y_true, y_pred):
     intersection = K.sum(y_true_f * y_pred_f)
     return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
 
+def weighted_dice_coef(y_true, y_pred):
+    mean = 0.21649066
+    w_1 = 1/mean**2
+    w_0 = 1/(1-mean)**2
+    y_true_f_1 = K.flatten(y_true)
+    y_pred_f_1 = K.flatten(y_pred)
+    y_true_f_0 = K.flatten(1-y_true)
+    y_pred_f_0 = K.flatten(1-y_pred)
+
+    intersection_0 = K.sum(y_true_f_0 * y_pred_f_0)
+    intersection_1 = K.sum(y_true_f_1 * y_pred_f_1)
+
+    return 2 * (w_0 * intersection_0 + w_1 * intersection_1) / ((w_0 * (K.sum(y_true_f_0) + K.sum(y_pred_f_0))) + (w_1 * (K.sum(y_true_f_1) + K.sum(y_pred_f_1))))
+
 def dice_mask(y_true, y_pred):
     return dice_coef(y_true, K.round(y_pred))
 
@@ -62,7 +93,7 @@ def bce_dice_loss(y_true, y_pred):
     return 0.5 * binary_crossentropy(y_true, y_pred) + dice_coef_loss(y_true, y_pred)
 
 def dice_coef_loss(y_true, y_pred):
-    return 1. - dice_coef(y_true, y_pred)
+    return 1. - weighted_dice_coef(y_true, y_pred)
 
 def gen(items, batch_size, training=True, inference=False):
     X    = np.zeros((batch_size, SY//S, SX//S, 3), dtype=np.float32)
@@ -77,7 +108,7 @@ def gen(items, batch_size, training=True, inference=False):
     _mask = np.zeros((SY, SX, 1), dtype=np.float32)
 
     data_gen_args = dict(
-        rotation_range=0.,
+        rotation_range=1.,
         zoom_range=0.)
 
     image_datagen = ImageDataGenerator(**data_gen_args)
@@ -85,7 +116,8 @@ def gen(items, batch_size, training=True, inference=False):
     assert batch_size <= 16
     input_folder = '.'
 
-    load_img   = lambda im, idx: imread(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx)), mode='YCbCr') / 255.
+    #load_img   = lambda im, idx: imread(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx)), mode='YCbCr') / 255.
+    load_img   = lambda im, idx: jpeg.JPEG(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx))).decode().astype(np.float32) / 255.
     load_yuv   = lambda im, idx: jpeg.JPEG(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx))).decodeYUV().astype(np.float32) / 255.
     load_mask  = lambda im, idx: imread(join(input_folder, 'train_masks', '{}_{:02d}_mask.gif'.format(im, idx))) / 255.
     mask_image = lambda im, mask: (im * np.expand_dims(mask, 2))
@@ -97,6 +129,8 @@ def gen(items, batch_size, training=True, inference=False):
     Xmean = None
     Xvar  = np.array([0.,0.,0.])
     Xmoments_printed = False
+    Ysum  = np.array([0.])
+    Ymean = None
 
     while True:
         if training:
@@ -205,12 +239,18 @@ def gen(items, batch_size, training=True, inference=False):
                     if Xmean is not None:
                         Xvar += ((X - Xmean) ** 2).mean(axis=(0,1,2))
 
+                if not inference:
+                    Ysum += y.mean(axis=(0,1,2))
+
         if Xmoments_printed is False and not args.yuv:
             if Xmean is None:
-                Xmean = Xsum / len(items)
+                Xmean = Xsum / (len(items) / batch_size)
                 print("Xmean: ", Xmean)
+                if not inference:
+                    Ymean = Ysum / (len(items) / batch_size)
+                    print("Ymean: ", Ymean)
             else:
-                Xvar /= len(items) 
+                Xvar /= (len(items) / batch_size)
                 print("Xvar: ", Xvar)
                 print("Scale: 1./", np.sqrt(Xvar), "Offset: -", Xmean / np.sqrt(Xvar))
                 Xmoments_printed = True
@@ -219,7 +259,7 @@ def gen(items, batch_size, training=True, inference=False):
 
 ids = list(set([(x.split('_')[0]).split('/')[1] for x in glob.glob('train/*_*.jpg')]))
 
-ids_train, ids_val = train_test_split(ids, test_size=0.1)
+ids_train, ids_val = train_test_split(ids, test_size=0.1, random_state=42)
 
 ids_train = list(itertools.product(ids_train, IMGS_IDX))
 ids_val   = list(itertools.product(ids_val,   IMGS_IDX))
@@ -237,27 +277,55 @@ if args.model:
     keras.metrics.dice_mask = dice_mask
 
     model = load_model(args.model)
-    match = re.search(r'([a-z\-]+)-s\d.*\.hdf5', args.model)
+    match = re.search(r'([a-z]+)-s\d-epoch(\d+)-.*\.hdf5', args.model)
     model_name = match.group(1)
+    last_epoch = int(match.group(2)) + 1
 
 else:
+    last_epoch = 0
 
     if args.unet:
         if args.yuv:
-            model = unet.U2Net((SY//S, SX//S, 3), activation='sigmoid', int_activation='relu')
+            model = unet.U3Net((SY//S, SX//S), activation='sigmoid', int_activation='relu', yuv=True, dropout_rate=0.05)
         else:           
-            model = unet.UNet((SY//S, SX//S, 3), activation='sigmoid', int_activation='relu')
+            model = unet.U3Net((SY//S, SX//S, 3), activation='sigmoid', int_activation='relu', yuv=False)
         model_name = 'unet'
+    elif args.resnet:
+        model = unet.RNet((SY//S, SX//S), activation='sigmoid', int_activation='relu', yuv=True, dropout_rate=0.05)
+        model_name = 'rnet'
     else:
-        model = dc.DenseNetFCN((SY//S, SX//S, 3), nb_dense_block=4, growth_rate=16, dropout_rate = 0.2,
-        	nb_layers_per_block=4, upsampling_type='deconv', classes=1, activation='sigmoid', 
+        model = dc.DenseNetFCN((SY//S, SX//S, 3), yuv=args.yuv, nb_dense_block=4, growth_rate=8, dropout_rate = 0.2,
+        	nb_layers_per_block=3, upsampling_type='deconv', classes=1, activation='sigmoid', init_conv_filters=32,
         	batch_norm=False, int_activation='relu', batchsize=args.batch_size)
         model_name = 'fc-densenet'
 
+if args.crf:
+    unary = model.layers[-1].output
+    print(unary)
+    unary = concatenate([Lambda(lambda x: 1.-x)(unary), unary], axis=3, name='unaries')
+    print(unary)
+    print(model.inputs[0])
+
+    crf   = CRF(image_dims=(SY//S, SX//S),
+                         num_classes=2,
+                         theta_alpha=160.,
+                         theta_beta=3.,
+                         theta_gamma=3.,
+                         num_iterations=10,
+                         batch_size = args.batch_size,
+                         name='crfrnn')([unary, model.layers[0].output])
+    print(crf)
+    output = crf
+    output = Lambda(lambda x: x[...,1:2])(crf)
+    print(output)
+    model  = Model(inputs=model.inputs, outputs=[output])
 
 model.summary()
+#opt = NadamAccum(lr=args.learning_rate, accum_iters=32)
+opt = Adam(lr=args.learning_rate)
+#opt = SGD(lr=args.learning_rate, decay=1e-6, momentum=0.9, nesterov=True)
 
-model.compile(Adam(lr=args.learning_rate), loss=bce_dice_loss, metrics=['accuracy', dice_coef, dice_mask])
+model.compile(optimizer=opt, loss=dice_coef_loss, metrics=['accuracy', dice_coef, dice_mask])
 
 def rle_encode(pixels):
     pixels = pixels[:, :1918,:]
@@ -351,7 +419,7 @@ else:
             monitor=monitor,
             verbose=0,  save_best_only=True, save_weights_only=False, mode='max', period=1)
 
-    reduce_lr = ReduceLROnPlateau(monitor=monitor, factor=0.5, patience=4, min_lr=1e-7, epsilon = 0.0001, verbose=1)
+    reduce_lr = ReduceLROnPlateau(monitor=monitor, factor=0.5, patience=4, min_lr=1e-7, epsilon = 0.00001, verbose=1, mode='max')
 
     # Function to display the target and prediciton
     def testmodel(epoch, logs):
@@ -374,6 +442,7 @@ else:
             validation_data  = gen(ids_val, args.batch_size, training = False),
             validation_steps = len(ids_val) // args.batch_size,
             epochs = args.max_epoch,
-            callbacks = [save_checkpoint, reduce_lr, testmodelcb])
+            callbacks = [save_checkpoint, reduce_lr, testmodelcb],
+            initial_epoch = last_epoch, max_queue_size=1, workers=1)
 
 

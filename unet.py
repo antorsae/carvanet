@@ -1,7 +1,7 @@
 from keras.models import Model
 from keras.layers import Input, concatenate, Conv2D, MaxPooling2D, Conv2DTranspose, Add, Dropout, BatchNormalization, Activation
 from keras_contrib.initializers import ConvolutionAware
-from keras_contrib.layers.normalization import InstanceNormalization
+from keras_contrib.layers.normalization import InstanceNormalization, BatchRenormalization
 from pooling import MaxPoolingWithArgmax2D, MaxUnpooling2D
 
 def UNet(input_shape, nb_dense_block=5, growth_rate=16, nb_layers_per_block=4,
@@ -117,26 +117,33 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
     else:
         RGB = Input(shape=(SY,       SX,     3))
 
+    use_res = False
+
     def downblock(f, channels, kernel, batch_norm = True, downsample = True, dilations = None):
         if not dilations:
             dilations = [1] * len(channels)
         features = []
+        lc = len(channels)
+        dense_points = set([lc, 3*lc//4, lc//2, lc//4 if lc//4 >2 else 3]) - set([1,2])
+        print(dense_points)
         for i, (channel, dilation) in enumerate(zip(channels, dilations)):
-            if i != len(channels) - 1:
+            if (i+1) not in dense_points:
                 ff  = f
                 res = f
             else:
                 ff = list(features)
-                ff.append(f)
+                #ff.append(f)
                 ff = concatenate(ff, axis=3)
                 res = None
-            if (i == len(channels) - 1) and batch_norm:
-                f = Conv2D(channel, kernel, use_bias=False, padding='same', kernel_initializer='he_uniform', dilation_rate= dilation)(ff)
+#            if (i == len(channels) - 1) and batch_norm:
+            if ((i+1) in dense_points) and batch_norm:
+                f = Conv2D(channel, kernel, padding='same', kernel_initializer='he_uniform', dilation_rate= dilation)(ff)
+                #f = BatchRenormalization(axis=3)(f)
                 f = InstanceNormalization(axis=3)(f)
                 f = Activation(int_activation)(f)
             else:
                 f = Conv2D(channel, kernel, activation = int_activation, padding='same', kernel_initializer='he_uniform', dilation_rate= dilation)(ff)
-            if res is not None and (f.shape[-1] == res.shape[-1]):
+            if res is not None and (f.shape[-1] == res.shape[-1]) and use_res:
                 f = Add()([f, res])
             features.append(f)
 
@@ -152,22 +159,28 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
             dilations = [1] * len(channels)
         u = concatenate([Conv2DTranspose(channels[0], (2, 2), strides=(2, 2), use_bias=False, padding='same')(f), s], axis=3)
         #u = concatenate([Conv2DTranspose(channels[0], (2, 2), strides=(1, 1), use_bias=False, padding='same')(MaxUnpooling2D(f)), s], axis=3)
+        lc = len(channels)
+        dense_points = set([lc, 3*lc//4, lc//2, lc//4 if lc//4 >2 else 3]) - set([1,2])
         for i, (channel, dilation) in enumerate(zip(channels, dilations)):
-            if i != len(channels) - 1:
+            print(i)
+            if (i+1) not in dense_points:
+#            if i < ((len(channels)//2)-1):
                 ff  = u
                 res = u
             else:
                 ff = list(features)
-                ff.append(u)
+                #ff.append(u)
                 ff = concatenate(ff, axis=3)
                 res = None
-            if (i == len(channels) - 1) and batch_norm:
-                u = Conv2D(channel, kernel, use_bias=False, padding='same', kernel_initializer='he_uniform', dilation_rate=dilation)(ff)
+            if ((i+1) in dense_points) and batch_norm:
+            #if (i == len(channels) - 1) and batch_norm:
+                u = Conv2D(channel, kernel, padding='same', kernel_initializer='he_uniform', dilation_rate=dilation)(ff)
+                #u = BatchRenormalization(axis=3)(u)
                 u = InstanceNormalization(axis=3)(u)
                 u = Activation(int_activation)(u)
             else:
                 u = Conv2D(channel, kernel, activation=int_activation, padding='same', kernel_initializer='he_uniform', dilation_rate= dilation)(ff)
-            if res is not None and (u.shape[-1] == res.shape[-1]):
+            if res is not None and (u.shape[-1] == res.shape[-1]) and use_res:
                 u = Add()([u, res])
             features.append(u)
         return u, features
@@ -176,15 +189,24 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
     K = 3
     J = 3
 
-    cY,c  = downblock(Y, channels = [12] * 8, kernel = J)
+    g   = 8
+
+    gY  = 8
+    gUV = 4
+
+    l   = 8
+    lY  = 8
+    lU  = 6
+
+    cY,c  = downblock(Y, channels = [gY] * lY, kernel = J)
     skip.append(cY)
 
-    cUV = downblock(UV, channels = [4] * 4, kernel = K, downsample=False)
+    cUV = downblock(UV, channels = [gUV] * lU, kernel = K, downsample=False)
 
     c = concatenate([c, cUV], axis=3)
 
-    downblocks = [[8] * 8, [8] * 8,  [8] * 8, [8] * 8]
-    dilations  = [[1] * 8, [1] * 8,  [1] * 8, [2] * 8]
+    downblocks = [[g] * l, [g] * l,  [g] * l]
+    dilations  = [[1] * l, [1] * l,  [2] * l]
 
     for db, di in zip(downblocks, dilations):
         cs,c = downblock(c, channels = db , kernel = K, dilations = di)
@@ -193,17 +215,21 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
     c = downblock(c, channels = downblocks[-1], kernel = K, downsample=False)
 
     upblocks = list(downblocks[::-1])
-    upblocks.append([12] * 8)
+    upblocks.append([gY] * lY)
 
     dilations = dilations[::-1]
-    dilations.append([1] * 8)
+    dilations.append([1] * lY)
 
     print(upblocks)
 
     for l, (ub, ui) in enumerate(zip(upblocks, dilations)):
         c, cc = upblock(c, skip[-l-1], channels = ub , kernel = K if l != (len(upblocks)-1) else J, dilations = ui)
 
-    c = Conv2D(1, (1, 1), activation=activation)(concatenate(cc, axis=3))
+    #c = Conv2D(gY//2, (1, 1), activation=int_activation, kernel_initializer='he_uniform')(concatenate(cc, axis=3))
+    #c = Conv2D(gY*2, (1, 1), activation=int_activation, kernel_initializer='he_uniform')(c)
+    #c = Conv2D(gY  , (1, 1), activation=int_activation, kernel_initializer='he_uniform')(concatenate(cc, axis=3))
+
+    c = Conv2D(1, (1, 1), activation=activation, kernel_initializer='he_uniform')(concatenate(cc, axis=3))
 
     model = Model(inputs=[Y, UV], outputs=[c])
 

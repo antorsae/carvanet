@@ -225,10 +225,6 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
     for l, (ub, ui) in enumerate(zip(upblocks, dilations)):
         c, cc = upblock(c, skip[-l-1], channels = ub , kernel = K if l != (len(upblocks)-1) else J, dilations = ui)
 
-    #c = Conv2D(gY//2, (1, 1), activation=int_activation, kernel_initializer='he_uniform')(concatenate(cc, axis=3))
-    #c = Conv2D(gY*2, (1, 1), activation=int_activation, kernel_initializer='he_uniform')(c)
-    #c = Conv2D(gY  , (1, 1), activation=int_activation, kernel_initializer='he_uniform')(concatenate(cc, axis=3))
-
     c = Conv2D(1, (1, 1), activation=activation, kernel_initializer='he_uniform')(concatenate(cc, axis=3))
 
     model = Model(inputs=[Y, UV], outputs=[c])

@@ -7,6 +7,7 @@ from scipy.misc import imread, imsave
 from os.path import join
 from sklearn.model_selection import train_test_split
 from skimage.transform import rescale, downscale_local_mean
+import scipy.ndimage
 from keras.optimizers import Adam, Adadelta, SGD
 from keras.losses import binary_crossentropy
 from keras import backend as K
@@ -34,6 +35,7 @@ parser.add_argument('-b', '--batch-size', type=int, default=1, help='Batch Size 
 parser.add_argument('-l', '--learning_rate', type=float, default=1e-3, help='Initial learning rate')
 parser.add_argument('-m', '--model', help='load hdf5 model (and continue training)')
 parser.add_argument('-s', '--scale', type=int, default=1, help='downscale e.g. -s 2')
+parser.add_argument('-ra', '--rotation', type=float, default=1., help='Rotation angle for augmentation e.g. -r 2')
 parser.add_argument('-u', '--unet', action='store_true', help='use UNET')
 parser.add_argument('-r', '--resnet', action='store_true', help='use residual dilated nets')
 parser.add_argument('-yuv', '--yuv', action='store_true', help='Use native YUV (chroma not upsampled)')
@@ -41,7 +43,6 @@ parser.add_argument('-t', '--test', action='store_true', help='Test model and ge
 parser.add_argument('-v', '--validate', action='store_true', help='Validate CSV submission file')
 parser.add_argument('-f', '--filename', default='eggs.csv', help='CSV file for submission')
 parser.add_argument('-tf', '--test-files', nargs='*', help='List of test files')
-parser.add_argument('-crf', '--crf', action='store_true', help='Add CRF layer')
 parser.add_argument('-c', '--cpu', action='store_true', help='force CPU usage')
 parser.add_argument('-i', '--idx', type=int, nargs='+', help='Indexes to use, e.g. -i 2 16')
 
@@ -108,7 +109,7 @@ def gen(items, batch_size, training=True, inference=False):
     _mask = np.zeros((SY, SX, 1), dtype=np.float32)
 
     data_gen_args = dict(
-        rotation_range=1.,
+        rotation_range=args.rotation,
         zoom_range=0.)
 
     image_datagen = ImageDataGenerator(**data_gen_args)
@@ -139,13 +140,19 @@ def gen(items, batch_size, training=True, inference=False):
         for _item in items:
 
             item, idx = _item
+            can_augment = False
 
             if not inference:
                 mask = load_mask(item, idx)[...,:1]
 
                 mask_in_borders = np.sum(mask[:,0]) + np.sum(mask[:,-1]) + np.sum(mask[0,:]) + np.sum(mask[-1,:])
+                can_augment = (mask_in_borders == 0.) and training
 
-                _mask[ :, :1918, :] = image_datagen.random_transform(mask, seed=seed_idx) if training and (mask_in_borders == 0.) else mask
+                shift = None
+                if can_augment:
+                    shift = np.random.randint(2, size=(2))
+                    mask =  np.roll(mask, shift)
+                _mask[ :, :1918, :] = image_datagen.random_transform(mask, seed=seed_idx) if can_augment else mask
                 _mask[ :, 1918:, :] = 0.
 
                 if idx in IMGS_IDX_TO_FLIP:
@@ -156,21 +163,30 @@ def gen(items, batch_size, training=True, inference=False):
             if args.yuv:
                 yuv  = load_yuv(item, idx)
                 _y   = yuv[:SX*SY].reshape((SY,SX,1))
+                if can_augment:
+                    _y = np.roll(_y, shift)
                 if yuv.shape[0] == SX*SY + (2 * SX*SY//4):
                     _u  = yuv[SX*SY            : SX*SY + SX*SY//4].reshape((SY//2, SX//2, 1))
                     _v  = yuv[SX*SY + SX*SY//4 :                 ].reshape((SY//2, SX//2, 1))
+                    if can_augment:
+                        _u = np.expand_dims(scipy.ndimage.interpolation.shift(np.squeeze(_u, axis=2), shift[::-1]/2.), axis=2)
+                        _v = np.expand_dims(scipy.ndimage.interpolation.shift(np.squeeze(_v, axis=2), shift[::-1]/2.), axis=2)
                     _uv = np.concatenate((_u,_v), axis=2)
+
                 elif yuv.shape[0] == SX*SY*3:
                     _u  = yuv[SX*SY:SX*SY*2].reshape((SY, SX, 1))
                     _v  = yuv[SX*SY*2:     ].reshape((SY, SX, 1))
+                    if can_augment:
+                        _u = np.roll(_u, shift)
+                        _v = np.roll(_v, shift)
                     _u  = downscale_local_mean(_u, (2,2,1))
                     _v  = downscale_local_mean(_v, (2,2,1))
                     _uv = np.concatenate((_u,_v), axis=2)
                 else:
                     assert False
 
-                _y   = image_datagen.random_transform(_y,  seed=seed_idx) if training and (mask_in_borders == 0.) else _y
-                _uv  = image_datagen.random_transform(_uv, seed=seed_idx) if training and (mask_in_borders == 0.) else _uv
+                _y   = image_datagen.random_transform(_y,  seed=seed_idx) if can_augment else _y
+                _uv  = image_datagen.random_transform(_uv, seed=seed_idx) if can_augment else _uv
 
                 _y [:,1918:,   :] = 0.                
                 _uv[:,1918//2:,:] = 0.
@@ -257,13 +273,6 @@ def gen(items, batch_size, training=True, inference=False):
 
         Xsum = 0.
 
-ids = list(set([(x.split('_')[0]).split('/')[1] for x in glob.glob('train/*_*.jpg')]))
-
-ids_train, ids_val = train_test_split(ids, test_size=0.1, random_state=42)
-
-ids_train = list(itertools.product(ids_train, IMGS_IDX))
-ids_val   = list(itertools.product(ids_val,   IMGS_IDX))
-
 if args.model:
     print("Loading model " + args.model)
 
@@ -275,11 +284,16 @@ if args.model:
     keras.losses.dice_coef_loss = dice_coef_loss
     keras.metrics.dice_coef = dice_coef
     keras.metrics.dice_mask = dice_mask
+    keras.optimizers.AdamAccum = AdamAccum
 
-    model = load_model(args.model)
-    match = re.search(r'([a-z]+)-s\d-epoch(\d+)-.*\.hdf5', args.model)
+    model = load_model(args.model, compile=False)
+    match = re.search(r'([a-z]+)(_([0-9]+)_([0-9]+))?-s\d-epoch(\d+)-.*\.hdf5', args.model)
     model_name = match.group(1)
-    last_epoch = int(match.group(2)) + 1
+    last_epoch = int(match.group(5)) + 1
+    if match.group(2):
+        IMGS_IDX = [int(match.group(3)), int(match.group(4))]
+        IDXS     = len(IMGS_IDX)
+        assert args.idx == None
 
 else:
     last_epoch = 0
@@ -299,30 +313,17 @@ else:
         	batch_norm=False, int_activation='relu', batchsize=args.batch_size)
         model_name = 'fc-densenet'
 
-if args.crf:
-    unary = model.layers[-1].output
-    print(unary)
-    unary = concatenate([Lambda(lambda x: 1.-x)(unary), unary], axis=3, name='unaries')
-    print(unary)
-    print(model.inputs[0])
+ids = list(set([(x.split('_')[0]).split('/')[1] for x in glob.glob('train/*_*.jpg')]))
 
-    crf   = CRF(image_dims=(SY//S, SX//S),
-                         num_classes=2,
-                         theta_alpha=160.,
-                         theta_beta=3.,
-                         theta_gamma=3.,
-                         num_iterations=10,
-                         batch_size = args.batch_size,
-                         name='crfrnn')([unary, model.layers[0].output])
-    print(crf)
-    output = crf
-    output = Lambda(lambda x: x[...,1:2])(crf)
-    print(output)
-    model  = Model(inputs=model.inputs, outputs=[output])
+ids_train, ids_val = train_test_split(ids, test_size=0.1, random_state=42)
+
+ids_train = list(itertools.product(ids_train, IMGS_IDX))
+ids_val   = list(itertools.product(ids_val,   IMGS_IDX))
 
 model.summary()
 #opt = NadamAccum(lr=args.learning_rate, accum_iters=32)
-opt = Adam(lr=args.learning_rate)
+#opt = Adam(lr=args.learning_rate)
+opt = AdamAccum(lr=args.learning_rate, accumulator=4)
 #opt = SGD(lr=args.learning_rate, decay=1e-6, momentum=0.9, nesterov=True)
 
 model.compile(optimizer=opt, loss=dice_coef_loss, metrics=['accuracy', dice_coef, dice_mask])
@@ -411,7 +412,7 @@ elif args.validate:
                 print(bad_entries)
 
 else:
-    metric  = "-val_dice_coef{val_dice_coef:.4f}"
+    metric  = "-val_dice_coef{val_dice_coef:.6f}"
     monitor = 'val_dice_coef'
     idx = "" if IMGS_IDX == range(1,17) else "_" + "_".join(map(str,IMGS_IDX))
 

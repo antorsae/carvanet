@@ -125,6 +125,8 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
         features = []
         lc = len(channels)
         dense_points = set([lc, 3*lc//4, lc//2, lc//4 if lc//4 >2 else 3]) - set([1,2])
+        #dense_points = range(3,lc+1)
+
         print(dense_points)
         for i, (channel, dilation) in enumerate(zip(channels, dilations)):
             if (i+1) not in dense_points:
@@ -161,6 +163,8 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
         #u = concatenate([Conv2DTranspose(channels[0], (2, 2), strides=(1, 1), use_bias=False, padding='same')(MaxUnpooling2D(f)), s], axis=3)
         lc = len(channels)
         dense_points = set([lc, 3*lc//4, lc//2, lc//4 if lc//4 >2 else 3]) - set([1,2])
+#        dense_points = range(3,lc+1)
+
         for i, (channel, dilation) in enumerate(zip(channels, dilations)):
             print(i)
             if (i+1) not in dense_points:

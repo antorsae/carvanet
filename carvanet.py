@@ -32,6 +32,7 @@ from nadamaccum import *
 parser = argparse.ArgumentParser()
 parser.add_argument('--max-epoch', type=int, default=200, help='Epoch to run')
 parser.add_argument('-b', '--batch-size', type=int, default=1, help='Batch Size during training, e.g. -b 2')
+parser.add_argument('-ba', '--batch-acc', type=int, default=1, help='Batch Size for training accumulation, e.g. -b 4')
 parser.add_argument('-l', '--learning_rate', type=float, default=1e-3, help='Initial learning rate')
 parser.add_argument('-m', '--model', help='load hdf5 model (and continue training)')
 parser.add_argument('-s', '--scale', type=int, default=1, help='downscale e.g. -s 2')
@@ -65,6 +66,17 @@ IDXS     = len(IMGS_IDX)
 
 IMGS_IDX_TO_FLIP = range(10,17)
 
+import scipy.stats as st
+def gkern(kernlen=21, nsig=3):
+    """Returns a 2D Gaussian kernel array."""
+
+    interval = (2*nsig+1.)/(kernlen)
+    x = np.linspace(-nsig-interval/2., nsig+interval/2., kernlen+1)
+    kern1d = np.diff(st.norm.cdf(x))
+    kernel_raw = np.sqrt(np.outer(kern1d, kern1d))
+    kernel = kernel_raw/kernel_raw.sum()
+    return kernel
+
 # From here: https://github.com/jocicmarko/ultrasound-nerve-segmentation/blob/master/train.py
 def dice_coef(y_true, y_pred):
     smooth = 0.
@@ -72,6 +84,25 @@ def dice_coef(y_true, y_pred):
     y_pred_f = K.flatten(y_pred)
     intersection = K.sum(y_true_f * y_pred_f)
     return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
+
+def weighted_border_dice_coef(y_true, y_pred):
+    k_width = 50
+    w_max = 1.
+    edge = K.abs(K.conv2d(y_true, np.float32([[[0,1,0],[1,-4,1],[0,1,0]]]).reshape((3,3,1,1)), padding='same', data_format='channels_last'))
+    #gk = gkern(kernlen=k_width,nsig=3).astype('float32')
+#    gk = w_max * K.ones(shape=(k_width,k_width, 1,1)) / 3.
+    gk = w_max * np.ones((k_width,k_width, 1,1), dtype='float32') / 3.
+
+    x_edge = K.clip(K.conv2d(edge, gk, padding='same', data_format='channels_last'), 0., w_max)
+
+    #imsave('edges.jpg', np.squeeze(K.eval(x_edge)[...,0]/w_max))
+
+    w_f      = K.flatten(x_edge + 1.)
+    y_true_f = K.flatten(y_true)
+    y_pred_f = K.flatten(y_pred)
+    intersection = K.sum(w_f * y_true_f * y_pred_f)
+    return (2. * intersection ) / (K.sum(w_f * y_true_f) + K.sum(w_f * y_pred_f))
+
 
 def weighted_dice_coef(y_true, y_pred):
     mean = 0.21649066
@@ -94,7 +125,8 @@ def bce_dice_loss(y_true, y_pred):
     return 0.5 * binary_crossentropy(y_true, y_pred) + dice_coef_loss(y_true, y_pred)
 
 def dice_coef_loss(y_true, y_pred):
-    return 1. - weighted_dice_coef(y_true, y_pred)
+    return 1. - weighted_border_dice_coef(y_true, y_pred)
+    #return 1. - dice_coef(y_true, y_pred)
 
 def gen(items, batch_size, training=True, inference=False):
     X    = np.zeros((batch_size, SY//S, SX//S, 3), dtype=np.float32)
@@ -117,7 +149,6 @@ def gen(items, batch_size, training=True, inference=False):
     assert batch_size <= 16
     input_folder = '.'
 
-    #load_img   = lambda im, idx: imread(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx)), mode='YCbCr') / 255.
     load_img   = lambda im, idx: jpeg.JPEG(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx))).decode().astype(np.float32) / 255.
     load_yuv   = lambda im, idx: jpeg.JPEG(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx))).decodeYUV().astype(np.float32) / 255.
     load_mask  = lambda im, idx: imread(join(input_folder, 'train_masks', '{}_{:02d}_mask.gif'.format(im, idx))) / 255.
@@ -143,15 +174,21 @@ def gen(items, batch_size, training=True, inference=False):
             can_augment = False
 
             if not inference:
-                mask = load_mask(item, idx)[...,:1]
+                mask = load_mask(item, idx)[...,0]
 
                 mask_in_borders = np.sum(mask[:,0]) + np.sum(mask[:,-1]) + np.sum(mask[0,:]) + np.sum(mask[-1,:])
                 can_augment = (mask_in_borders == 0.) and training
-
+                can_flip    = (idx in [1, 9]) and training
+                flip = np.random.randint(2)
                 shift = None
+
+                if can_flip and flip:
+                    mask = np.flip(mask, 1)
+
                 if can_augment:
                     shift = np.random.randint(2, size=(2))
-                    mask =  np.roll(mask, shift)
+                    mask =  scipy.ndimage.interpolation.shift(mask, shift)
+                mask = np.expand_dims(mask, axis=2)
                 _mask[ :, :1918, :] = image_datagen.random_transform(mask, seed=seed_idx) if can_augment else mask
                 _mask[ :, 1918:, :] = 0.
 
@@ -162,23 +199,37 @@ def gen(items, batch_size, training=True, inference=False):
 
             if args.yuv:
                 yuv  = load_yuv(item, idx)
-                _y   = yuv[:SX*SY].reshape((SY,SX,1))
+                _y   = yuv[:SX*SY].reshape((SY,SX))
+
+                if can_flip and flip:
+                    _y = np.flip(_y, 1)
                 if can_augment:
-                    _y = np.roll(_y, shift)
+                    _y =  scipy.ndimage.interpolation.shift(_y, shift)
+                _y = np.expand_dims(_y, axis=2)
                 if yuv.shape[0] == SX*SY + (2 * SX*SY//4):
-                    _u  = yuv[SX*SY            : SX*SY + SX*SY//4].reshape((SY//2, SX//2, 1))
-                    _v  = yuv[SX*SY + SX*SY//4 :                 ].reshape((SY//2, SX//2, 1))
+                    _u  = yuv[SX*SY            : SX*SY + SX*SY//4].reshape((SY//2, SX//2))
+                    _v  = yuv[SX*SY + SX*SY//4 :                 ].reshape((SY//2, SX//2))
+                    if can_flip and flip:
+                        _u = np.flip(_u, 1)
+                        _v = np.flip(_v, 1)
                     if can_augment:
-                        _u = np.expand_dims(scipy.ndimage.interpolation.shift(np.squeeze(_u, axis=2), shift[::-1]/2.), axis=2)
-                        _v = np.expand_dims(scipy.ndimage.interpolation.shift(np.squeeze(_v, axis=2), shift[::-1]/2.), axis=2)
+                        _u = scipy.ndimage.interpolation.shift(_u, shift/2.)
+                        _v = scipy.ndimage.interpolation.shift(_v, shift/2.)
+                    _u = np.expand_dims(_u, axis=2)
+                    _v = np.expand_dims(_v, axis=2)
                     _uv = np.concatenate((_u,_v), axis=2)
 
                 elif yuv.shape[0] == SX*SY*3:
-                    _u  = yuv[SX*SY:SX*SY*2].reshape((SY, SX, 1))
-                    _v  = yuv[SX*SY*2:     ].reshape((SY, SX, 1))
+                    _u  = yuv[SX*SY:SX*SY*2].reshape((SY, SX))
+                    _v  = yuv[SX*SY*2:     ].reshape((SY, SX))
+                    if can_flip and flip:
+                        _u = np.flip(_u, 1)
+                        _v = np.flip(_v, 1)
                     if can_augment:
-                        _u = np.roll(_u, shift)
-                        _v = np.roll(_v, shift)
+                        _u = scipy.ndimage.interpolation.shift(_u, shift)
+                        _v = scipy.ndimage.interpolation.shift(_v, shift)
+                    _u = np.expand_dims(_u, axis=2)
+                    _v = np.expand_dims(_v, axis=2)
                     _u  = downscale_local_mean(_u, (2,2,1))
                     _v  = downscale_local_mean(_v, (2,2,1))
                     _uv = np.concatenate((_u,_v), axis=2)
@@ -323,7 +374,7 @@ ids_val   = list(itertools.product(ids_val,   IMGS_IDX))
 model.summary()
 #opt = NadamAccum(lr=args.learning_rate, accum_iters=32)
 #opt = Adam(lr=args.learning_rate)
-opt = AdamAccum(lr=args.learning_rate, accumulator=4)
+opt = AdamAccum(lr=args.learning_rate, accumulator=args.batch_acc)
 #opt = SGD(lr=args.learning_rate, decay=1e-6, momentum=0.9, nesterov=True)
 
 model.compile(optimizer=opt, loss=dice_coef_loss, metrics=['accuracy', dice_coef, dice_mask])

@@ -22,7 +22,6 @@ import sys
 import csv
 from tqdm import tqdm
 import jpeg4py as jpeg
-#from crfrnn_layer import CrfRnnLayer as CRF
 from keras_contrib.layers import CRF
 
 import densenet_fc as dc
@@ -36,7 +35,7 @@ parser.add_argument('-ba', '--batch-acc', type=int, default=1, help='Batch Size 
 parser.add_argument('-l', '--learning_rate', type=float, default=1e-3, help='Initial learning rate')
 parser.add_argument('-m', '--model', help='load hdf5 model (and continue training)')
 parser.add_argument('-s', '--scale', type=int, default=1, help='downscale e.g. -s 2')
-parser.add_argument('-ra', '--rotation', type=float, default=1., help='Rotation angle for augmentation e.g. -r 2')
+parser.add_argument('-ra', '--rotation', type=float, default=0.5, help='Rotation angle for augmentation e.g. -r 2')
 parser.add_argument('-u', '--unet', action='store_true', help='use UNET')
 parser.add_argument('-r', '--resnet', action='store_true', help='use residual dilated nets')
 parser.add_argument('-yuv', '--yuv', action='store_true', help='Use native YUV (chroma not upsampled)')
@@ -57,6 +56,10 @@ SX   = 1920
 SY   = 1280
 S    = args.scale
 
+TRAIN_FOLDER = 'train_hq'
+TEST_FOLDER  = 'test_hq'
+MODEL_FOLDER = 'models'
+
 if args.idx:
     IMGS_IDX = args.idx
 else:
@@ -64,7 +67,7 @@ else:
 
 IDXS     = len(IMGS_IDX)
 
-IMGS_IDX_TO_FLIP = range(10,17)
+IMGS_IDX_TO_FLIP = [] #range(10,17)
 
 import scipy.stats as st
 def gkern(kernlen=21, nsig=3):
@@ -86,23 +89,16 @@ def dice_coef(y_true, y_pred):
     return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
 
 def weighted_border_dice_coef(y_true, y_pred):
-    k_width = 50
-    w_max = 1.
+    k_width = 20
+    w_max = 2.
     edge = K.abs(K.conv2d(y_true, np.float32([[[0,1,0],[1,-4,1],[0,1,0]]]).reshape((3,3,1,1)), padding='same', data_format='channels_last'))
-    #gk = gkern(kernlen=k_width,nsig=3).astype('float32')
-#    gk = w_max * K.ones(shape=(k_width,k_width, 1,1)) / 3.
     gk = w_max * np.ones((k_width,k_width, 1,1), dtype='float32') / 3.
-
     x_edge = K.clip(K.conv2d(edge, gk, padding='same', data_format='channels_last'), 0., w_max)
-
-    #imsave('edges.jpg', np.squeeze(K.eval(x_edge)[...,0]/w_max))
-
     w_f      = K.flatten(x_edge + 1.)
     y_true_f = K.flatten(y_true)
     y_pred_f = K.flatten(y_pred)
     intersection = K.sum(w_f * y_true_f * y_pred_f)
     return (2. * intersection ) / (K.sum(w_f * y_true_f) + K.sum(w_f * y_pred_f))
-
 
 def weighted_dice_coef(y_true, y_pred):
     mean = 0.21649066
@@ -125,8 +121,46 @@ def bce_dice_loss(y_true, y_pred):
     return 0.5 * binary_crossentropy(y_true, y_pred) + dice_coef_loss(y_true, y_pred)
 
 def dice_coef_loss(y_true, y_pred):
-    return 1. - weighted_border_dice_coef(y_true, y_pred)
-    #return 1. - dice_coef(y_true, y_pred)
+    #return 1. - weighted_border_dice_coef(y_true, y_pred)
+    return 1. - dice_coef(y_true, y_pred)
+    #return weighted_bce_dice_loss(y_true, y_pred)
+
+# from https://www.kaggle.com/lyakaap/weighing-boundary-pixels-loss-script-by-keras2
+# weight: weighted tensor(same shape with mask image)
+def weighted_bce_loss(y_true, y_pred, weight):
+    # avoiding overflow
+    epsilon = 1e-7
+    y_pred = K.clip(y_pred, epsilon, 1. - epsilon)
+    logit_y_pred = K.log(y_pred / (1. - y_pred))
+    
+    # https://www.tensorflow.org/api_docs/python/tf/nn/weighted_cross_entropy_with_logits
+    loss = (1. - y_true) * logit_y_pred + (1. + (weight - 1.) * y_true) * \
+    (K.log(1. + K.exp(-K.abs(logit_y_pred))) + K.maximum(-logit_y_pred, 0.))
+    return K.sum(loss) / K.sum(weight)
+
+def weighted_dice_loss(y_true, y_pred, weight):
+    smooth = 1.
+    w, m1, m2 = weight * weight, y_true, y_pred
+    intersection = (m1 * m2)
+    score = (2. * K.sum(w * intersection) + smooth) / (K.sum(w * m1) + K.sum(w * m2) + smooth)
+    loss = 1. - K.sum(score)
+    return loss
+
+def weighted_bce_dice_loss(y_true, y_pred):
+    y_true = K.cast(y_true, 'float32')
+    y_pred = K.cast(y_pred, 'float32')
+    # if we want to get same size of output, kernel size must be odd number
+    averaged_mask = K.pool2d(
+            y_true, pool_size=(11, 11), strides=(1, 1), padding='same', pool_mode='avg')
+    border = K.cast(K.greater(averaged_mask, 0.005), 'float32') * K.cast(K.less(averaged_mask, 0.995), 'float32')
+    weight = K.ones_like(averaged_mask)
+    w0 = K.sum(weight)
+    weight += border * 2
+    w1 = K.sum(weight)
+    weight *= (w0 / w1)
+    loss = weighted_bce_loss(y_true, y_pred, weight) + \
+    weighted_dice_loss(y_true, y_pred, weight)
+    return loss
 
 def gen(items, batch_size, training=True, inference=False):
     X    = np.zeros((batch_size, SY//S, SX//S, 3), dtype=np.float32)
@@ -140,17 +174,17 @@ def gen(items, batch_size, training=True, inference=False):
     _img  = np.zeros((SY, SX, 3), dtype=np.float32)
     _mask = np.zeros((SY, SX, 1), dtype=np.float32)
 
-    data_gen_args = dict(
-        rotation_range=args.rotation,
-        zoom_range=0.)
+    #data_gen_args = dict(
+    #    rotation_range=args.rotation,
+    #    zoom_range=0.)
 
-    image_datagen = ImageDataGenerator(**data_gen_args)
+    #image_datagen = ImageDataGenerator(**data_gen_args)
     
     assert batch_size <= 16
     input_folder = '.'
 
-    load_img   = lambda im, idx: jpeg.JPEG(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx))).decode().astype(np.float32) / 255.
-    load_yuv   = lambda im, idx: jpeg.JPEG(join(input_folder, 'test' if inference else 'train', '{}_{:02d}.jpg'.format(im, idx))).decodeYUV().astype(np.float32) / 255.
+    load_img   = lambda im, idx: jpeg.JPEG(join(input_folder, TEST_FOLDER if inference else TRAIN_FOLDER, '{}_{:02d}.jpg'.format(im, idx))).decode().astype(np.float32) / 255.
+    load_yuv   = lambda im, idx: jpeg.JPEG(join(input_folder, TEST_FOLDER if inference else TRAIN_FOLDER, '{}_{:02d}.jpg'.format(im, idx))).decodeYUV().astype(np.float32) / 255.
     load_mask  = lambda im, idx: imread(join(input_folder, 'train_masks', '{}_{:02d}_mask.gif'.format(im, idx))) / 255.
     mask_image = lambda im, mask: (im * np.expand_dims(mask, 2))
 
@@ -171,25 +205,31 @@ def gen(items, batch_size, training=True, inference=False):
         for _item in items:
 
             item, idx = _item
-            can_augment = False
+            can_rotate = False
+            can_shift  = False
+            can_flip   = False
 
             if not inference:
                 mask = load_mask(item, idx)[...,0]
 
                 mask_in_borders = np.sum(mask[:,0]) + np.sum(mask[:,-1]) + np.sum(mask[0,:]) + np.sum(mask[-1,:])
-                can_augment = (mask_in_borders == 0.) and training
-                can_flip    = (idx in [1, 9]) and training
+                can_rotate = (mask_in_borders == 0.) and (args.rotation != 0.) and training
+                shift = np.random.randint(2, size=(2))
+                can_shift  = (mask_in_borders == 0.) and training and (np.sum(shift) != 0.)
+                can_flip   = training # (idx in [1, 9]) and training
                 flip = np.random.randint(2)
-                shift = None
+                rotate = (np.random.random() - 0.5) * args.rotation 
 
                 if can_flip and flip:
                     mask = np.flip(mask, 1)
 
-                if can_augment:
-                    shift = np.random.randint(2, size=(2))
+                if can_shift:
                     mask =  scipy.ndimage.interpolation.shift(mask, shift)
                 mask = np.expand_dims(mask, axis=2)
-                _mask[ :, :1918, :] = image_datagen.random_transform(mask, seed=seed_idx) if can_augment else mask
+                #scipy.ndimage.interpolation.rotate
+                _mask[ :, :1918, :] = scipy.ndimage.interpolation.rotate(mask, rotate, reshape=False) if can_rotate else mask
+
+                #_mask[ :, :1918, :] = image_datagen.random_transform(mask, seed=seed_idx) if can_rotate else mask
                 _mask[ :, 1918:, :] = 0.
 
                 if idx in IMGS_IDX_TO_FLIP:
@@ -203,41 +243,37 @@ def gen(items, batch_size, training=True, inference=False):
 
                 if can_flip and flip:
                     _y = np.flip(_y, 1)
-                if can_augment:
+                if can_shift:
                     _y =  scipy.ndimage.interpolation.shift(_y, shift)
                 _y = np.expand_dims(_y, axis=2)
+
                 if yuv.shape[0] == SX*SY + (2 * SX*SY//4):
-                    _u  = yuv[SX*SY            : SX*SY + SX*SY//4].reshape((SY//2, SX//2))
-                    _v  = yuv[SX*SY + SX*SY//4 :                 ].reshape((SY//2, SX//2))
-                    if can_flip and flip:
-                        _u = np.flip(_u, 1)
-                        _v = np.flip(_v, 1)
-                    if can_augment:
-                        _u = scipy.ndimage.interpolation.shift(_u, shift/2.)
-                        _v = scipy.ndimage.interpolation.shift(_v, shift/2.)
-                    _u = np.expand_dims(_u, axis=2)
-                    _v = np.expand_dims(_v, axis=2)
+                    _u  = yuv[SX*SY            : SX*SY + SX*SY//4].reshape((SY//2, SX//2, 1))
+                    _v  = yuv[SX*SY + SX*SY//4 :                 ].reshape((SY//2, SX//2, 1))
                     _uv = np.concatenate((_u,_v), axis=2)
+                    if can_flip and flip:
+                        _uv = np.flip(_uv, 1)
+                    if can_shift:
+                        _uv = scipy.ndimage.interpolation.shift(_uv, np.hstack((shift/2.,[0])))
 
                 elif yuv.shape[0] == SX*SY*3:
-                    _u  = yuv[SX*SY:SX*SY*2].reshape((SY, SX))
-                    _v  = yuv[SX*SY*2:     ].reshape((SY, SX))
-                    if can_flip and flip:
-                        _u = np.flip(_u, 1)
-                        _v = np.flip(_v, 1)
-                    if can_augment:
-                        _u = scipy.ndimage.interpolation.shift(_u, shift)
-                        _v = scipy.ndimage.interpolation.shift(_v, shift)
-                    _u = np.expand_dims(_u, axis=2)
-                    _v = np.expand_dims(_v, axis=2)
-                    _u  = downscale_local_mean(_u, (2,2,1))
-                    _v  = downscale_local_mean(_v, (2,2,1))
+                    _u  = yuv[SX*SY:SX*SY*2].reshape((SY, SX, 1))
+                    _v  = yuv[SX*SY*2:     ].reshape((SY, SX, 1))
                     _uv = np.concatenate((_u,_v), axis=2)
+                    if can_flip and flip:
+                        _uv = np.flip(_uv, 1)
+                    if can_shift:
+                        _uv = scipy.ndimage.interpolation.shift(_uv, np.hstack((shift,[0])))
+                    _uv = downscale_local_mean(_uv, (2,2,1))                    
+
                 else:
                     assert False
 
-                _y   = image_datagen.random_transform(_y,  seed=seed_idx) if can_augment else _y
-                _uv  = image_datagen.random_transform(_uv, seed=seed_idx) if can_augment else _uv
+                #scipy.ndimage.interpolation.rotate(mask, rotate)
+                _y   = scipy.ndimage.interpolation.rotate(_y,  rotate, reshape=False) if can_rotate else _y
+                _uv  = scipy.ndimage.interpolation.rotate(_uv, rotate, reshape=False) if can_rotate else _uv
+                #_y   = image_datagen.random_transform(_y,  seed=seed_idx) if can_rotate else _y
+                #_uv  = image_datagen.random_transform(_uv, seed=seed_idx) if can_rotate else _uv
 
                 _y [:,1918:,   :] = 0.                
                 _uv[:,1918//2:,:] = 0.
@@ -364,7 +400,8 @@ else:
         	batch_norm=False, int_activation='relu', batchsize=args.batch_size)
         model_name = 'fc-densenet'
 
-ids = list(set([(x.split('_')[0]).split('/')[1] for x in glob.glob('train/*_*.jpg')]))
+ids = list(set([(x.split('/')[1]).split('_')[0] for x in glob.glob(join(TRAIN_FOLDER,'*_*.jpg'))]))
+ids.sort()
 
 ids_train, ids_val = train_test_split(ids, test_size=0.1, random_state=42)
 
@@ -415,7 +452,7 @@ if args.test:
     if args.test_files:
         ids_test = [[x.split('_')[0], int(x.split('_')[1])] for x in args.test_files]
     else:
-        _ids_test = list(set([(x.split('_')[0]).split('/')[1] for x in glob.glob('test/*_*.jpg')]))
+        _ids_test = list(set([(x.split('/')[1]).split('_')[0] for x in glob.glob(join(TEST_FOLDER, '*_*.jpg'))]))
         ids_test = list(itertools.product(_ids_test, IMGS_IDX))
 
     generator = gen(ids_test, args.batch_size, training = False, inference = True)
@@ -468,7 +505,7 @@ else:
     idx = "" if IMGS_IDX == range(1,17) else "_" + "_".join(map(str,IMGS_IDX))
 
     save_checkpoint = ModelCheckpoint(
-            model_name+idx+"-s"+str(S)+"-epoch{epoch:02d}"+metric+".hdf5",
+            join(MODEL_FOLDER, model_name+idx+"-s"+str(S)+"-epoch{epoch:02d}"+metric+".hdf5"),
             monitor=monitor,
             verbose=0,  save_best_only=True, save_weights_only=False, mode='max', period=1)
 

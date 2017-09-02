@@ -35,7 +35,9 @@ parser.add_argument('-ba', '--batch-acc', type=int, default=1, help='Batch Size 
 parser.add_argument('-l', '--learning_rate', type=float, default=1e-3, help='Initial learning rate')
 parser.add_argument('-m', '--model', help='load hdf5 model (and continue training)')
 parser.add_argument('-s', '--scale', type=int, default=1, help='downscale e.g. -s 2')
-parser.add_argument('-ra', '--rotation', type=float, default=0.5, help='Rotation angle for augmentation e.g. -r 2')
+parser.add_argument('-ar', '--rotation', type=float, default=0.5, help='Rotation angle for augmentation e.g. -ar 2')
+parser.add_argument('-as', '--shift', action='store_true', help='Enable 1 pixel shifts')
+parser.add_argument('-az', '--zoom', type=float, default=1., help='Zoom for augmentation e.g. -az 1.1')
 parser.add_argument('-u', '--unet', action='store_true', help='use UNET')
 parser.add_argument('-r', '--resnet', action='store_true', help='use residual dilated nets')
 parser.add_argument('-yuv', '--yuv', action='store_true', help='Use native YUV (chroma not upsampled)')
@@ -215,7 +217,7 @@ def gen(items, batch_size, training=True, inference=False):
                 mask_in_borders = np.sum(mask[:,0]) + np.sum(mask[:,-1]) + np.sum(mask[0,:]) + np.sum(mask[-1,:])
                 can_rotate = (mask_in_borders == 0.) and (args.rotation != 0.) and training
                 shift = np.random.randint(2, size=(2))
-                can_shift  = (mask_in_borders == 0.) and training and (np.sum(shift) != 0.)
+                can_shift  = (mask_in_borders == 0.) and training and (np.sum(shift) != 0.) and args.shift
                 can_flip   = training # (idx in [1, 9]) and training
                 flip = np.random.randint(2)
                 rotate = (np.random.random() - 0.5) * args.rotation 

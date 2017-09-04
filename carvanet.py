@@ -47,6 +47,7 @@ parser.add_argument('-f', '--filename', default='eggs.csv', help='CSV file for s
 parser.add_argument('-tf', '--test-files', nargs='*', help='List of test files')
 parser.add_argument('-c', '--cpu', action='store_true', help='force CPU usage')
 parser.add_argument('-i', '--idx', type=int, nargs='+', help='Indexes to use, e.g. -i 2 16')
+parser.add_argument('-pt', '--half', action='store_true', help='Only do half image')
 
 args = parser.parse_args()
 
@@ -164,7 +165,12 @@ def weighted_bce_dice_loss(y_true, y_pred):
     weighted_dice_loss(y_true, y_pred, weight)
     return loss
 
-def gen(items, batch_size, training=True, inference=False):
+def gen(items, batch_size, training=True, inference=False, half=False, SX=SX, SY=SY):
+
+    _SY = SY
+    if half:
+        SY = SY // 2
+
     X    = np.zeros((batch_size, SY//S, SX//S, 3), dtype=np.float32)
 
     if not inference:
@@ -185,9 +191,9 @@ def gen(items, batch_size, training=True, inference=False):
     assert batch_size <= 16
     input_folder = '.'
 
-    load_img   = lambda im, idx: jpeg.JPEG(join(input_folder, TEST_FOLDER if inference else TRAIN_FOLDER, '{}_{:02d}.jpg'.format(im, idx))).decode().astype(np.float32) / 255.
+    load_img   = lambda im, idx: jpeg.JPEG(join(input_folder, TEST_FOLDER if inference else TRAIN_FOLDER, '{}_{:02d}.jpg'.format(im, idx))).decode()[:SY, ...].astype(np.float32) / 255.
     load_yuv   = lambda im, idx: jpeg.JPEG(join(input_folder, TEST_FOLDER if inference else TRAIN_FOLDER, '{}_{:02d}.jpg'.format(im, idx))).decodeYUV().astype(np.float32) / 255.
-    load_mask  = lambda im, idx: imread(join(input_folder, 'train_masks', '{}_{:02d}_mask.gif'.format(im, idx))) / 255.
+    load_mask  = lambda im, idx: imread(join(input_folder, 'train_masks', '{}_{:02d}_mask.gif'.format(im, idx)))[:SY, ...] / 255.
     mask_image = lambda im, mask: (im * np.expand_dims(mask, 2))
 
     batch_idx = 0
@@ -241,7 +247,7 @@ def gen(items, batch_size, training=True, inference=False):
 
             if args.yuv:
                 yuv  = load_yuv(item, idx)
-                _y   = yuv[:SX*SY].reshape((SY,SX))
+                _y   = yuv[:SX*_SY].reshape((_SY,SX))[:SY,...]
 
                 if can_flip and flip:
                     _y = np.flip(_y, 1)
@@ -249,18 +255,18 @@ def gen(items, batch_size, training=True, inference=False):
                     _y =  scipy.ndimage.interpolation.shift(_y, shift)
                 _y = np.expand_dims(_y, axis=2)
 
-                if yuv.shape[0] == SX*SY + (2 * SX*SY//4):
-                    _u  = yuv[SX*SY            : SX*SY + SX*SY//4].reshape((SY//2, SX//2, 1))
-                    _v  = yuv[SX*SY + SX*SY//4 :                 ].reshape((SY//2, SX//2, 1))
+                if yuv.shape[0] == SX*_SY + (2 * SX*_SY//4):
+                    _u  = yuv[SX*_SY            : SX*_SY + SX*_SY//4].reshape((_SY//2, SX//2, 1))[:SY//2,...]
+                    _v  = yuv[SX*_SY + SX*_SY//4 :                  ].reshape((_SY//2, SX//2, 1))[:SY//2,...]
                     _uv = np.concatenate((_u,_v), axis=2)
                     if can_flip and flip:
                         _uv = np.flip(_uv, 1)
                     if can_shift:
                         _uv = scipy.ndimage.interpolation.shift(_uv, np.hstack((shift/2.,[0])))
 
-                elif yuv.shape[0] == SX*SY*3:
-                    _u  = yuv[SX*SY:SX*SY*2].reshape((SY, SX, 1))
-                    _v  = yuv[SX*SY*2:     ].reshape((SY, SX, 1))
+                elif yuv.shape[0] == SX*_SY*3:
+                    _u  = yuv[SX*_SY:SX*_SY*2].reshape((_SY, SX, 1))[:SY,...]
+                    _v  = yuv[SX*_SY*2:      ].reshape((_SY, SX, 1))[:SY,...]
                     _uv = np.concatenate((_u,_v), axis=2)
                     if can_flip and flip:
                         _uv = np.flip(_uv, 1)
@@ -389,7 +395,7 @@ else:
 
     if args.unet:
         if args.yuv:
-            model = unet.U3Net((SY//S, SX//S), activation='sigmoid', int_activation='relu', yuv=True, dropout_rate=0.05)
+            model = unet.U3Net((SY//S, SX//S), activation='sigmoid', int_activation='relu', yuv=True, half=args.half)
         else:           
             model = unet.U3Net((SY//S, SX//S, 3), activation='sigmoid', int_activation='relu', yuv=False)
         model_name = 'unet'
@@ -515,7 +521,7 @@ else:
 
     # Function to display the target and prediciton
     def testmodel(epoch, logs):
-        predx, predy = next(gen(ids_val, args.batch_size, training = False))
+        predx, predy = next(gen(ids_val, args.batch_size, training = False, half=args.half))
         
         predout = model.predict(
             predx,
@@ -529,9 +535,9 @@ else:
     testmodelcb = LambdaCallback(on_epoch_end=testmodel)
 
     model.fit_generator(
-            generator        = gen(ids_train, args.batch_size),
+            generator        = gen(ids_train, args.batch_size, half=args.half),
             steps_per_epoch  = len(ids_train)  // args.batch_size,
-            validation_data  = gen(ids_val, args.batch_size, training = False),
+            validation_data  = gen(ids_val, args.batch_size, training = False, half=args.half),
             validation_steps = len(ids_val) // args.batch_size,
             epochs = args.max_epoch,
             callbacks = [save_checkpoint, reduce_lr, testmodelcb],

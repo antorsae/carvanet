@@ -176,7 +176,7 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
             features.append(f)
             receptive_field += (kernel - 1) * dilation
 
-        f = SpatialDropout2D(0.02)(f)
+        f = SpatialDropout2D(0.01)(f)
 
         if downsample:
 #            return (f, MaxPooling2D(pool_size=(2, 2))(f))
@@ -184,18 +184,21 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
 
 #            return (f, MaxPoolingWithArgmax2D(pool_size=(2, 2))(f))
         else:
-            return (f, receptive_field)
+            return (f, None, receptive_field)
 
-    def upblock(f, s, channels, kernel, use_res, batch_norm = True, dilations = None, resize_conv=False):
+    def upblock(f, s, channels, kernel, use_res, batch_norm = True, dilations = None, resize_conv=False, upsample=True):
         features = []
         if not dilations:
             dilations = [1] * len(channels)
-        if resize_conv:
-            u = Conv2DTranspose(channels[0], (2, 2), strides=(2, 2), use_bias=False, padding='same', kernel_initializer=Constant(value=1), trainable=False)(f)
-            u = C2D(channels[0], kernel, activation=int_activation, padding='same', kernel_initializer=int_ini)(u)
-            u = concatenate([u, s], axis=3)
+        if upsample:
+            if resize_conv:
+                u = Conv2DTranspose(channels[0], (2, 2), strides=(2, 2), use_bias=False, padding='same', kernel_initializer=Constant(value=1), trainable=False)(f)
+                u = C2D(channels[0], kernel, activation=int_activation, padding='same', kernel_initializer=int_ini)(u)
+                u = concatenate([u, s], axis=3)
+            else:
+                u = concatenate([Conv2DTranspose(channels[0], (2, 2), strides=(2, 2), use_bias=False, padding='same', kernel_initializer=int_ini)(f), s], axis=3)
         else:
-            u = concatenate([Conv2DTranspose(channels[0], (2, 2), strides=(2, 2), use_bias=False, padding='same', kernel_initializer=int_ini)(f), s], axis=3)
+                u = s
         lc = len(channels)
         #dense_points = set([lc, 3*lc//4, lc//2, lc//4 if lc//4 >2 else 3]) - set([1,2])
         dense_points = range(3,lc+1)
@@ -228,32 +231,36 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
     K = 3
     J = 3
 
-    g   = 12*2
+    g   = 16
 
     gY  = 12
-    gUV = 8
+    gUV = 12
 
     l   = 4
-    lY  = 8
+    lY  = 6
     lU  = 6
 
-    cY,c, receptive_field  = downblock(Y, channels = [gY] * lY, kernel = J, use_res = False)
+    _Y  = InstanceNormalization(axis=3)(Y)
+    _UV = InstanceNormalization(axis=3)(UV)
+
+
+    cY,c, receptive_field  = downblock(_Y, channels = [gY] * lY, kernel = J, use_res = False, downsample=True)
     skip.append(cY)
 
-    cUV, _ = downblock(UV, channels = [gUV] * lU, kernel = K, use_res = False, downsample=False)
+    cUV, _, _ = downblock(_UV, channels = [gUV] * lU, kernel = K, use_res = False, downsample=False)
 
     c = concatenate([c, cUV], axis=3)
 
-    downblocks = [[g*4//3] * l, [g*2] * 3]#,  [g] * l]
-    dilations  = [[1] * l,      [2, 4, 8] ]#,  [2] * l]
-    res        = [False,    False]
+    downblocks = [[g] * 6]#, [g*2] * 3]#,  [g] * l]
+    dilations  = [[2,4,8,16,32,64]]#  [2, 4, 8] ]#,  [2] * l]
+    res        = [False]#,    False]
 
     for i, (db, di, ds) in enumerate(zip(downblocks, dilations, res)):
-        cs,c, rf = downblock(c, channels = db , kernel = K, use_res = ds, dilations = di)
-        receptive_field += rf * i 
+        cs,c, rf = downblock(c, channels = db , kernel = K, use_res = ds, dilations = di, downsample=True)
+        receptive_field += rf * (i+1) 
         skip.append(cs)
 
-    c, rf = downblock(c, channels = downblocks[-1], kernel = K, use_res = res[-1], dilations = dilations[-1], downsample=False)
+    c, _, rf = downblock(c, channels = downblocks[-1], kernel = K, use_res = res[-1], dilations = dilations[-1], downsample=False)
     receptive_field += rf*i
 
     print("Receptive field: " + str(receptive_field) + " pixels")
@@ -271,7 +278,7 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
     print(upblocks)
 
     for l, (ub, ui, us) in enumerate(zip(upblocks, dilations, res)):
-        c, cc = upblock(c, skip[-l-1], channels = ub , kernel = K if l != (len(upblocks)-1) else J, use_res = us, dilations = ui)
+        c, cc = upblock(c, skip[-l-1], channels = ub , kernel = K if l != (len(upblocks)-1) else J, use_res = us, dilations = ui, upsample=True)
 
     c = Conv2D(1, (1, 1), activation=activation, kernel_initializer='he_uniform')(concatenate(cc, axis=3))
 

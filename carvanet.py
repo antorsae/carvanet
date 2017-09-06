@@ -7,6 +7,7 @@ from scipy.misc import imread, imsave
 from os.path import join
 from sklearn.model_selection import train_test_split
 from skimage.transform import rescale, downscale_local_mean
+import skimage.exposure
 import scipy.ndimage
 from keras.optimizers import Adam, Adadelta, SGD
 from keras.losses import binary_crossentropy
@@ -42,12 +43,16 @@ parser.add_argument('-u', '--unet', action='store_true', help='use UNET')
 parser.add_argument('-r', '--resnet', action='store_true', help='use residual dilated nets')
 parser.add_argument('-yuv', '--yuv', action='store_true', help='Use native YUV (chroma not upsampled)')
 parser.add_argument('-t', '--test', action='store_true', help='Test model and generate CSV submission file')
+parser.add_argument('-tef', '--test-flip', action='store_true', help='Flip ensembling for testing')
 parser.add_argument('-v', '--validate', action='store_true', help='Validate CSV submission file')
 parser.add_argument('-f', '--filename', default='eggs.csv', help='CSV file for submission')
 parser.add_argument('-tf', '--test-files', nargs='*', help='List of test files')
+parser.add_argument('-tdr', '--test-dry-run', action='store_true', help='Dry run (only test first 100 cars)')
+parser.add_argument('-tbe', '--test-bad-entries', action='store_true', help='Test bad RLE entries (debugging)')
 parser.add_argument('-c', '--cpu', action='store_true', help='force CPU usage')
 parser.add_argument('-i', '--idx', type=int, nargs='+', help='Indexes to use, e.g. -i 2 16')
 parser.add_argument('-pt', '--half', action='store_true', help='Only do half image')
+parser.add_argument('-ca', '--clahe', action='store_true', help='Contrast Limited Adaptive Histogram Equalization')
 
 args = parser.parse_args()
 
@@ -118,14 +123,14 @@ def weighted_dice_coef(y_true, y_pred):
     return 2 * (w_0 * intersection_0 + w_1 * intersection_1) / ((w_0 * (K.sum(y_true_f_0) + K.sum(y_pred_f_0))) + (w_1 * (K.sum(y_true_f_1) + K.sum(y_pred_f_1))))
 
 def dice_mask(y_true, y_pred):
-    return dice_coef(y_true, K.round(y_pred))
+    return 100 * dice_coef(y_true, K.round(y_pred))
 
 def bce_dice_loss(y_true, y_pred):
     return 0.5 * binary_crossentropy(y_true, y_pred) + dice_coef_loss(y_true, y_pred)
 
 def dice_coef_loss(y_true, y_pred):
     #return 1. - weighted_border_dice_coef(y_true, y_pred)
-    return 1. - dice_coef(y_true, y_pred)
+    return 100. * (1. - dice_coef(y_true, y_pred))
     #return weighted_bce_dice_loss(y_true, y_pred)
 
 # from https://www.kaggle.com/lyakaap/weighing-boundary-pixels-loss-script-by-keras2
@@ -249,6 +254,11 @@ def gen(items, batch_size, training=True, inference=False, half=False, SX=SX, SY
                 yuv  = load_yuv(item, idx)
                 _y   = yuv[:SX*_SY].reshape((_SY,SX))[:SY,...]
 
+                if args.clahe:
+                    #print(np.amax(_y), np.amin(_y))
+                    _y = skimage.exposure.equalize_adapthist(_y, kernel_size=64, clip_limit=0.02)
+                    #print(np.amax(_y), np.amin(_y))
+
                 if can_flip and flip:
                     _y = np.flip(_y, 1)
                 if can_shift:
@@ -312,7 +322,8 @@ def gen(items, batch_size, training=True, inference=False, half=False, SX=SX, SY
             if batch_idx == batch_size:
 
                 if args.yuv:
-                # X = X / np.array([ 0.2466268 ,  0.02347598,  0.02998368]) - np.array([  2.8039049 ,  21.16614256,  16.76252866])
+                    #pass
+                    #X = X / np.array([ 0.2466268 ,  0.02347598,  0.02998368]) - np.array([  2.8039049 ,  21.16614256,  16.76252866])
                     X_Y  /= 0.2466268
                     X_Y  -= 2.8039049
 
@@ -461,19 +472,33 @@ if args.test:
         ids_test = [[x.split('_')[0], int(x.split('_')[1])] for x in args.test_files]
     else:
         _ids_test = list(set([(x.split('/')[1]).split('_')[0] for x in glob.glob(join(TEST_FOLDER, '*_*.jpg'))]))
+        if args.test_dry_run:
+            _ids_test = _ids_test[:100]
         ids_test = list(itertools.product(_ids_test, IMGS_IDX))
 
     generator = gen(ids_test, args.batch_size, training = False, inference = True)
 
-    with open(args.filename, 'wb') as csvfile:
+    with open(args.filename, 'wb') as csvfile, open("flip-" + args.filename, 'wb') as csvfile_flip:
         writer = csv.writer(csvfile, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
         writer.writerow(['img', 'rle_mask'])
+        if args.test_flip:
+            writer_flip = csv.writer(csvfile_flip, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+            writer_flip.writerow(['img', 'rle_mask'])
         assert len(ids_test) % args.batch_size == 0
         id_generator = itertools.izip(*[itertools.islice(ids_test, j, None, args.batch_size) for j in range(args.batch_size)])
         for i in tqdm(range(len(ids_test) // args.batch_size)):
             ids = next(id_generator)
-            prediction_masks = model.predict_on_batch(next(generator))
-            for idx,prediction_mask  in zip(ids, prediction_masks):
+            mini_batch = next(generator)
+            prediction_masks = model.predict_on_batch(mini_batch)
+            if args.test_flip:
+                #print(len(mini_batch))
+                #print(mini_batch[1].shape)
+                _prediction_masks = model.predict_on_batch([np.flip(mini_batch[0], 1), np.flip(mini_batch[1], 1)])
+                _prediction_masks = np.flip(_prediction_masks, 1)
+                prediction_masks_flipped_ensemble = (prediction_masks + _prediction_masks) / 2.
+            else:
+                prediction_masks_flipped_ensemble = prediction_masks
+            for idx,prediction_mask, prediction_mask_flipped_ensemble in zip(ids, prediction_masks, prediction_masks_flipped_ensemble):
                 fname = '{}_{:02d}.jpg'.format(idx[0], idx[1])
 
                 if idx[1] in IMGS_IDX_TO_FLIP:
@@ -483,13 +508,19 @@ if args.test:
                     imsave('pred_'+fname, prediction_mask[...,0])
 
                 rle = rle_encode(prediction_mask)
-                bad_entries = return_bad_rle_entries(rle)
-                if bad_entries:
-                    print(fname)
-                    print(bad_entries)
-                    imsave('bad_'+fname, prediction_mask[...,0])
-
                 writer.writerow([fname, rle_to_string(rle)])
+
+                if args.test_flip:
+                    rle_flipped_ensemble = rle_encode(prediction_mask_flipped_ensemble)
+                    writer_flip.writerow([fname, rle_to_string(rle_flipped_ensemble)])
+
+                if args.test_bad_entries:
+                    bad_entries = return_bad_rle_entries(rle)
+                    if bad_entries:
+                        print(fname)
+                        print(bad_entries)
+                        imsave('bad_'+fname, prediction_mask[...,0])
+
 
 elif args.validate:
     csv.field_size_limit(sys.maxsize)

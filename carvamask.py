@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-b', '--background-index', action='store_true', help='Build background index')
-parser.add_argument('-bb', '--build-background', type=str, help='Build background for filename (e.g. -bb fff9b3a5373f_04.jpg')
+parser.add_argument('-bb', '--build-background', type=str, help='Build background for filename or all (e.g. -bb fff9b3a5373f_04.jpg or -bb all)')
 parser.add_argument('-i', '--idx', type=int, nargs='+', help='Indexes to use, e.g. -i 2 16')
 
 args = parser.parse_args()
@@ -36,7 +36,7 @@ SX   = 1918
 SY   = 1280
 
 TRAIN_FOLDER = 'train_hq'
-BACKGROUND_FOLDER = 'background_hq'
+BACKGROUND_FOLDER = 'train_background_hq'
 BACKORDER_FILENAME = 'background_order.npy'
 
 ids = list(set([(x.split('/')[1]).split('_')[0] for x in glob.glob(join(TRAIN_FOLDER, '*_*.jpg'))]))
@@ -55,12 +55,17 @@ if args.background_index:
 	max0 = np.amax(background_counts[...,0])
 	imsave("back0.png", background_counts[...,0].astype(np.float32) / max0)
 	background_order = np.argsort(background_counts, axis=2)
-	imsave("backo0.png", background_order[...,0].astype(np.float32) / (IDXS-1))
+	max0 = np.amax(background_counts)
+	for i in range(IDXS):
+		for j in range(IDXS):
+			background_order[(background_order[...,j] == i) & (background_counts[...,i] < max0 * 0.8), j] = -1 
+	imsave("backo0.png", background_order[...,IDXS-1].astype(np.float32) / (IDXS-1))
 	np.save(BACKORDER_FILENAME, background_order)
 
 elif args.build_background:
 
 	background_order = np.load(BACKORDER_FILENAME)
+	background_order += 1
 
 	if args.build_background != 'all':
 		_this_car, _this_idx = args.build_background.split('.')[0].split('_')
@@ -72,24 +77,26 @@ elif args.build_background:
 
 	BACK_INDEXES = 1
 
-	car_views = np.empty((SY, SX, 3, IDXS), dtype=np.float32)
+	car_views = np.empty((SY, SX, 3, IDXS+1), dtype=np.float32)
 	background_index = np.empty((SY,SX,BACK_INDEXES), dtype=np.int32)
 	background_img = np.empty((SY,SX,3), dtype=np.float32)
 
+	car_views[...,0] = (1.,0.,1.)
 	for this_car in tqdm(_this_car):
 		for idx in IMGS_IDX:
-			car_views[...,idx-1] = load_img(this_car, idx)
+			car_views[...,idx] = load_img(this_car, idx)
 
 		for this_idx in _this_idx:
 			for back in range(BACK_INDEXES):
 				background_index[...,back] = background_order[...,IDXS-1-back]
 				background_index[background_index[...,back] == this_idx, back] = background_order[background_index[...,back] == this_idx, IDXS-2-back]
 
+			# TODO: do smarter mean if BACK_INDEXES != 1
 			background_index = background_index[...,0].reshape((SY,SX,1))
 			assert np.all(background_index != this_idx)
 
 			background_index = np.repeat(background_index, repeats = 3, axis=2)
-			for i in range(IDXS):
+			for i in range(IDXS+1):
 				background_img = np.select([background_index == i, background_index != i], [car_views[...,i], background_img])
 
 			imsave(join(BACKGROUND_FOLDER,'{}_{:02d}.jpg'.format(this_car, this_idx)), background_img)

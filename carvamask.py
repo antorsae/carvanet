@@ -18,17 +18,34 @@ from tqdm import tqdm
 import jpeg4py as jpeg
 from tqdm import tqdm
 
+def rle_decode(mask_rle, shape):
+	'''
+	mask_rle: run-length as string formated (start length)
+	shape: (height,width) of array to return 
+	Returns numpy array, 1 - mask, 0 - background
+
+	'''
+	s = mask_rle.split()
+	starts, lengths = [np.asarray(x, dtype=int) for x in (s[0:][::2], s[1:][::2])]
+	starts -= 1
+	ends = starts + lengths
+	img = np.zeros(shape[0]*shape[1], dtype=np.uint8)
+	for lo, hi in zip(starts, ends):
+		img[lo:hi] = 1
+	return img.reshape(shape)
+
 parser = argparse.ArgumentParser()
 parser.add_argument('-b', '--background-index', action='store_true', help='Build background index')
 parser.add_argument('-bb', '--build-background', type=str, help='Build background for filename or all (e.g. -bb fff9b3a5373f_04.jpg or -bb all)')
 parser.add_argument('-i', '--idx', type=int, nargs='+', help='Indexes to use, e.g. -i 2 16')
+parser.add_argument('-cm', '--coarse-mask', type=str, help='Use coarse mask for backgroung generation')
 
 args = parser.parse_args()
 
 if args.idx:
-    IMGS_IDX = args.idx
+	IMGS_IDX = args.idx
 else:
-    IMGS_IDX = range(1,17)
+	IMGS_IDX = range(1,17)
 
 IDXS     = len(IMGS_IDX)
 
@@ -55,17 +72,14 @@ if args.background_index:
 	max0 = np.amax(background_counts[...,0])
 	imsave("back0.png", background_counts[...,0].astype(np.float32) / max0)
 	background_order = np.argsort(background_counts, axis=2)
-	max0 = np.amax(background_counts)
 	for i in range(IDXS):
+		max0 = np.amax(background_counts[...,i])
 		for j in range(IDXS):
-			background_order[(background_order[...,j] == i) & (background_counts[...,i] < max0 * 0.8), j] = -1 
+			background_order[(background_order[...,j] == i) & (background_counts[...,i] < max0 * 0.9), j] = -1 
 	imsave("backo0.png", background_order[...,IDXS-1].astype(np.float32) / (IDXS-1))
 	np.save(BACKORDER_FILENAME, background_order)
 
 elif args.build_background:
-
-	background_order = np.load(BACKORDER_FILENAME)
-	background_order += 1
 
 	if args.build_background != 'all':
 		_this_car, _this_idx = args.build_background.split('.')[0].split('_')
@@ -75,31 +89,69 @@ elif args.build_background:
 		_this_car = ids
 		_this_idx = IMGS_IDX
 
-	BACK_INDEXES = 1
-
 	car_views = np.empty((SY, SX, 3, IDXS+1), dtype=np.float32)
-	background_index = np.empty((SY,SX,BACK_INDEXES), dtype=np.int32)
+	car_views[...,0] = (1.,0.,1.)
 	background_img = np.empty((SY,SX,3), dtype=np.float32)
 
-	car_views[...,0] = (1.,0.,1.)
+	if not args.coarse_mask:
+		background_order = np.load(BACKORDER_FILENAME)
+		background_order += 1
+		BACK_INDEXES = 1
+		background_index = np.empty((SY,SX,BACK_INDEXES), dtype=np.int32)
+	else:
+		with open(args.coarse_mask, 'rb') as csvfile:
+			reader = csv.reader(csvfile, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+			rle_dict = {rows[0]: rows[1] for rows in reader}
+		dilation_kernel = np.ones((5,5),np.uint8)
+		car_masks = np.empty((SY, SX, IDXS), dtype=np.uint8)
+
 	for this_car in tqdm(_this_car):
+		cars_backgrounds = np.empty((SY,SX,3,IDXS), dtype=np.float32)
+
 		for idx in IMGS_IDX:
 			car_views[...,idx] = load_img(this_car, idx)
 
-		for this_idx in _this_idx:
+			if args.coarse_mask:
+				fname = '{}_{:02d}.jpg'.format(this_car, idx)
+				assert fname in rle_dict
+				car_masks[...,idx-1] = cv2.dilate(rle_decode(rle_dict[fname], (1280, 1918) ),dilation_kernel,iterations = 1)
+				cars_backgrounds[...,idx-1] = np.copy(car_views[...,idx])
+				cars_backgrounds[car_masks[...,idx-1] == 1,:, idx-1] = np.nan
+
+		if args.coarse_mask:
+
+			def reject_outliers(data, m = 5.,mode='median'):
+				if mode == 'median':
+					d = np.abs(data - np.expand_dims(np.nanmedian(data, axis=3), axis=3))
+				elif mode == 'min':
+					d = np.abs(data - np.expand_dims(np.nanmin(data, axis=3), axis=3))
+				mdev = np.expand_dims(np.nanmedian(d, axis=3), axis=3)
+				s = d/mdev
+				data[s > m ] = np.nan
+				return data
+
+			car_mask_ovelaid = np.sum(car_masks, axis=2)
+			background_candidates = car_mask_ovelaid < 16-2
+			cars_backgrounds[:1280//2,...] = reject_outliers(cars_backgrounds[:1280//2,...])
+			cars_backgrounds[1280//2:,...] = reject_outliers(cars_backgrounds[1280//2:,...], mode='min')
+
+			background_img = np.nanmedian(cars_backgrounds, axis=3)
+
+			background_img[~background_candidates,:] = (1.,0.,1.)
+			imsave(join(BACKGROUND_FOLDER,'{}.png'.format(this_car)), background_img)
+
+		else:
 			for back in range(BACK_INDEXES):
 				background_index[...,back] = background_order[...,IDXS-1-back]
-				background_index[background_index[...,back] == this_idx, back] = background_order[background_index[...,back] == this_idx, IDXS-2-back]
 
 			# TODO: do smarter mean if BACK_INDEXES != 1
 			background_index = background_index[...,0].reshape((SY,SX,1))
-			assert np.all(background_index != this_idx)
 
 			background_index = np.repeat(background_index, repeats = 3, axis=2)
 			for i in range(IDXS+1):
 				background_img = np.select([background_index == i, background_index != i], [car_views[...,i], background_img])
 
-			imsave(join(BACKGROUND_FOLDER,'{}_{:02d}.jpg'.format(this_car, this_idx)), background_img)
+			imsave(join(BACKGROUND_FOLDER,'{}.png'.format(this_car)), background_img)
 
 else:
 

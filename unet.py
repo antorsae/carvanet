@@ -186,7 +186,7 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
         else:
             return (f, None, receptive_field)
 
-    def upblock(f, s, channels, kernel, use_res, batch_norm = True, dilations = None, resize_conv=False, upsample=True):
+    def upblock(f, s, channels, kernel, use_res, batch_norm = True, dilations = None, resize_conv=True, upsample=True):
         features = []
         if not dilations:
             dilations = [1] * len(channels)
@@ -233,16 +233,15 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
 
     g   = 16
 
-    gY  = 12
-    gUV = 12
+    gY  = 16
+    gUV = 16
 
     l   = 4
-    lY  = 6
-    lU  = 6
+    lY  = 4
+    lU  = 4
 
     _Y  = InstanceNormalization(axis=3)(Y)
     _UV = InstanceNormalization(axis=3)(UV)
-
 
     cY,c, receptive_field  = downblock(_Y, channels = [gY] * lY, kernel = J, use_res = False, downsample=True)
     skip.append(cY)
@@ -252,27 +251,27 @@ def U3Net(input_shape, activation='sigmoid', int_activation='relu', yuv=False, d
     c = concatenate([c, cUV], axis=3)
 
     downblocks = [[g] * 6]#, [g*2] * 3]#,  [g] * l]
-    dilations  = [[2,4,8,16,32,64]]#  [2, 4, 8] ]#,  [2] * l]
+    dilations  = [[1,2,4,8,16,32]]#  [2, 4, 8] ]#,  [2] * l]
     res        = [False]#,    False]
 
-    for i, (db, di, ds) in enumerate(zip(downblocks, dilations, res)):
-        cs,c, rf = downblock(c, channels = db , kernel = K, use_res = ds, dilations = di, downsample=True)
-        receptive_field += rf * (i+1) 
-        skip.append(cs)
+    #for i, (db, di, ds) in enumerate(zip(downblocks, dilations, res)):
+    #    cs,c, rf = downblock(c, channels = db , kernel = K, use_res = ds, dilations = di, downsample=True)
+    #    receptive_field += rf * (i+1) 
+    #    skip.append(cs)
 
     c, _, rf = downblock(c, channels = downblocks[-1], kernel = K, use_res = res[-1], dilations = dilations[-1], downsample=False)
-    receptive_field += rf*i
+    receptive_field += rf
 
     print("Receptive field: " + str(receptive_field) + " pixels")
 
 
-    upblocks = list(downblocks[::-1])
+    upblocks = []#list(downblocks[::-1])
     upblocks.append([gY] * lY)
 
-    dilations = dilations[::-1]
+    dilations = []#dilations[::-1]
     dilations.append([1] * lY)
 
-    res       = res[::-1]
+    res       = []#res[::-1]
     res.append(False)
 
     print(upblocks)

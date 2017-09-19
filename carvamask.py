@@ -36,9 +36,10 @@ def rle_decode(mask_rle, shape):
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-b', '--background-index', action='store_true', help='Build background index')
-parser.add_argument('-bb', '--build-background', type=str, help='Build background for filename or all (e.g. -bb fff9b3a5373f_04.jpg or -bb all)')
+parser.add_argument('-bb', '--build-background', type=str, help='Build background for filename or all, e.g. -bb fff9b3a5373f_04.jpg or -bb all')
 parser.add_argument('-i', '--idx', type=int, nargs='+', help='Indexes to use, e.g. -i 2 16')
-parser.add_argument('-cm', '--coarse-mask', type=str, help='Use coarse mask for backgroung generation')
+parser.add_argument('-cm', '--coarse-mask', type=str, help='Use coarse mask for backgroung generation, e.g. -cm train_masks.csv')
+parser.add_argument('-t', '--test', action='store_true', help='Generate test backgrounds (instead of train) ')
 
 args = parser.parse_args()
 
@@ -51,32 +52,36 @@ IDXS     = len(IMGS_IDX)
 
 SX   = 1918
 SY   = 1280
+if args.test:
+	TRAIN_FOLDER 	  = 'test_hq'
+	BACKGROUND_FOLDER = 'test_background_hq'
+else:
+	TRAIN_FOLDER 	  = 'train_hq'
+	BACKGROUND_FOLDER = 'train_background_hq'
 
-TRAIN_FOLDER = 'train_hq'
-BACKGROUND_FOLDER = 'train_background_hq'
 BACKORDER_FILENAME = 'background_order.npy'
 
 ids = list(set([(x.split('/')[1]).split('_')[0] for x in glob.glob(join(TRAIN_FOLDER, '*_*.jpg'))]))
 ids.sort()
-#ids_train = list(itertools.product(ids_train, IMGS_IDX))
 
 load_mask  = lambda im, idx: imread(join('train_masks', '{}_{:02d}_mask.gif'.format(im, idx))).astype('uint8') # / 255. ).astype('float32') #/ 255.
 load_img   = lambda im, idx: jpeg.JPEG(join(TRAIN_FOLDER, '{}_{:02d}.jpg'.format(im, idx))).decode()[:SY, ...].astype(np.float32) / 255.
 
 if args.background_index:
+	assert args.test is False
 	background_counts = np.zeros((SY,SX,IDXS), dtype=np.int32)
 	for item in tqdm(ids):
 		for idx in IMGS_IDX:
 			mask = load_mask(item, idx)[...,0] / 255
 			background_counts[...,idx-1] += (1 - mask)
 	max0 = np.amax(background_counts[...,0])
-	imsave("back0.png", background_counts[...,0].astype(np.float32) / max0)
+	#imsave("back0.png", background_counts[...,0].astype(np.float32) / max0)
 	background_order = np.argsort(background_counts, axis=2)
 	for i in range(IDXS):
 		max0 = np.amax(background_counts[...,i])
 		for j in range(IDXS):
 			background_order[(background_order[...,j] == i) & (background_counts[...,i] < max0 * 0.9), j] = -1 
-	imsave("backo0.png", background_order[...,IDXS-1].astype(np.float32) / (IDXS-1))
+	#imsave("backo0.png", background_order[...,IDXS-1].astype(np.float32) / (IDXS-1))
 	np.save(BACKORDER_FILENAME, background_order)
 
 elif args.build_background:
@@ -155,6 +160,7 @@ elif args.build_background:
 
 else:
 
+	# PLAYGROUND AREA. Have fun!
 	areas = []
 	for item in ids:
 		for idx in IMGS_IDX:

@@ -65,7 +65,7 @@ SY   = 1280
 S    = args.scale
 
 TRAIN_FOLDER = 'train_hq'
-TEST_FOLDER  = 'test_hq'
+TEST_FOLDER  = 'test'
 MODEL_FOLDER = 'models'
 
 if args.idx:
@@ -75,7 +75,8 @@ else:
 
 IDXS     = len(IMGS_IDX)
 
-IMGS_IDX_TO_FLIP = [] #range(10,17)
+IMGS_IDX_TO_FLIP = []#
+range(10,17)
 
 import scipy.stats as st
 def gkern(kernlen=21, nsig=3):
@@ -254,9 +255,13 @@ def gen(items, batch_size, training=True, inference=False, half=False, SX=SX, SY
                 yuv  = load_yuv(item, idx)
                 _y   = yuv[:SX*_SY].reshape((_SY,SX))[:SY,...]
 
-                if args.clahe:
+                if args.clahe and training:
                     #print(np.amax(_y), np.amin(_y))
-                    _y = skimage.exposure.equalize_adapthist(_y, kernel_size=64, clip_limit=0.02)
+                    clahe_random = np.random.randint(2)
+                    if clahe_random:
+                        sizes  = [16, 32, 64, 128]
+                        limits = [0.01, 0.02, 0.04, 0.08]
+                        _y = skimage.exposure.equalize_adapthist(_y, kernel_size=sizes[np.random.randint(4)], clip_limit=limits[np.random.randint(4)])
                     #print(np.amax(_y), np.amin(_y))
 
                 if can_flip and flip:
@@ -322,13 +327,13 @@ def gen(items, batch_size, training=True, inference=False, half=False, SX=SX, SY
             if batch_idx == batch_size:
 
                 if args.yuv:
-                    #pass
                     #X = X / np.array([ 0.2466268 ,  0.02347598,  0.02998368]) - np.array([  2.8039049 ,  21.16614256,  16.76252866])
-                    X_Y  /= 0.2466268
-                    X_Y  -= 2.8039049
+                    #X_Y  /= 0.2466268
+                    #X_Y  -= 2.8039049
 
-                    X_UV /= np.float32([  0.02347598,  0.02998368 ]) 
-                    X_UV -= np.float32([ 21.16614256, 16.76252866 ])
+                    #X_UV /= np.float32([  0.02347598,  0.02998368 ]) 
+                    #X_UV -= np.float32([ 21.16614256, 16.76252866 ])
+                    pass
 
                 else:
                     X = X / np.float32([ 0.23165472,  0.23369996,  0.23183985]) - np.float32([ 3.13899873,  3.12144822,  3.11967396])
@@ -486,16 +491,19 @@ if args.test:
             writer_flip.writerow(['img', 'rle_mask'])
         assert len(ids_test) % args.batch_size == 0
         id_generator = itertools.izip(*[itertools.islice(ids_test, j, None, args.batch_size) for j in range(args.batch_size)])
+        mask_saved = False
         for i in tqdm(range(len(ids_test) // args.batch_size)):
             ids = next(id_generator)
             mini_batch = next(generator)
             prediction_masks = model.predict_on_batch(mini_batch)
             if args.test_flip:
-                #print(len(mini_batch))
-                #print(mini_batch[1].shape)
-                _prediction_masks = model.predict_on_batch([np.flip(mini_batch[0], 1), np.flip(mini_batch[1], 1)])
-                _prediction_masks = np.flip(_prediction_masks, 1)
+                _prediction_masks = model.predict_on_batch([np.flip(mini_batch[0], 2), np.flip(mini_batch[1], 2)])
+                _prediction_masks = np.flip(_prediction_masks, 2)
                 prediction_masks_flipped_ensemble = (prediction_masks + _prediction_masks) / 2.
+                if not mask_saved:
+                    print(prediction_masks_flipped_ensemble.shape, np.amax(prediction_masks_flipped_ensemble[0]), np.amin(prediction_masks_flipped_ensemble[0]))
+                    imsave('pred_ensemble.gif', prediction_masks_flipped_ensemble[0,...,0])
+                    mask_saved = True
             else:
                 prediction_masks_flipped_ensemble = prediction_masks
             for idx,prediction_mask, prediction_mask_flipped_ensemble in zip(ids, prediction_masks, prediction_masks_flipped_ensemble):
